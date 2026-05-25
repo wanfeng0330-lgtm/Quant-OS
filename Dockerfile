@@ -14,10 +14,6 @@ COPY packages/ packages/
 # Copy API app
 COPY apps/api/ apps/api/
 
-# Copy entrypoint
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-
 # Install dependencies (no dev deps)
 RUN uv sync --frozen --no-dev
 
@@ -27,4 +23,5 @@ WORKDIR /app/apps/api
 # Expose port
 EXPOSE 8000
 
-ENTRYPOINT ["/entrypoint.sh"]
+# Start server
+CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

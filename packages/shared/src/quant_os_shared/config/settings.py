@@ -102,7 +102,7 @@ class AppSettings(BaseSettings):
     env: str = "development"
     debug: bool = True
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = Field(default=8000, alias="PORT")
     log_level: str = "DEBUG"
     cors_origins: list[str] = [
         "http://localhost:3000",
