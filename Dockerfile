@@ -20,8 +20,5 @@ RUN uv sync --frozen --no-dev
 # Set working directory to API
 WORKDIR /app/apps/api
 
-# Expose port
-EXPOSE 8000
-
-# Start server
+# Start server on port 8000 (Railway routes to it)
 CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
