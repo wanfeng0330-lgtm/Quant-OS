@@ -516,21 +516,30 @@ async def _execute_tool_node(
                     total = sync_result.get("total", 0)
                     await session.commit()
 
-                # Fetch live market snapshot from AKShare (includes prices, change%, volume, industry)
+                # Fetch live market snapshot from AKShare
                 live_snapshot = []
                 industry_counts = {}
+                market_stats = {}
                 try:
                     import akshare as ak
                     import pandas as _pd
+                    import asyncio as _aio
+
+                    # Add delay to avoid rate limiting when running in parallel with other nodes
+                    await _aio.sleep(3)
 
                     log_fn("正在获取实时行情快照...", node_id=node["id"])
                     df_spot = await provider._run_with_retry(ak.stock_zh_a_spot_em)
 
                     if not df_spot.empty:
+                        log_fn(f"实时快照获取成功: {len(df_spot)} 只股票", node_id=node["id"])
+
                         # Build industry distribution
-                        if "板块" in df_spot.columns:
-                            ind_counts = df_spot["板块"].value_counts().head(15)
-                            industry_counts = {str(k): int(v) for k, v in ind_counts.items()}
+                        for col_name in ["板块", "所属行业", "行业"]:
+                            if col_name in df_spot.columns:
+                                ind_counts = df_spot[col_name].value_counts().head(15)
+                                industry_counts = {str(k): int(v) for k, v in ind_counts.items()}
+                                break
 
                         # Get top gainers and losers
                         if "涨跌幅" in df_spot.columns:
@@ -538,57 +547,54 @@ async def _execute_tool_node(
                             df_spot["最新价"] = _pd.to_numeric(df_spot["最新价"], errors="coerce")
                             df_spot["成交额"] = _pd.to_numeric(df_spot["成交额"], errors="coerce")
 
+                            valid = df_spot.dropna(subset=["涨跌幅"])
+
                             # Top 5 gainers
-                            top_gain = df_spot.nlargest(5, "涨跌幅")
+                            top_gain = valid.nlargest(5, "涨跌幅")
                             for _, row in top_gain.iterrows():
                                 live_snapshot.append({
                                     "code": str(row.get("代码", "")),
                                     "name": str(row.get("名称", "")),
                                     "price": float(row["最新价"]) if _pd.notna(row["最新价"]) else None,
-                                    "change_pct": float(row["涨跌幅"]) if _pd.notna(row["涨跌幅"]) else None,
-                                    "amount": float(row["成交额"]) if _pd.notna(row["成交额"]) else None,
+                                    "change_pct": round(float(row["涨跌幅"]), 2) if _pd.notna(row["涨跌幅"]) else None,
                                     "type": "gainer",
                                 })
 
                             # Top 5 losers
-                            top_lose = df_spot.nsmallest(5, "涨跌幅")
+                            top_lose = valid.nsmallest(5, "涨跌幅")
                             for _, row in top_lose.iterrows():
                                 live_snapshot.append({
                                     "code": str(row.get("代码", "")),
                                     "name": str(row.get("名称", "")),
                                     "price": float(row["最新价"]) if _pd.notna(row["最新价"]) else None,
-                                    "change_pct": float(row["涨跌幅"]) if _pd.notna(row["涨跌幅"]) else None,
-                                    "amount": float(row["成交额"]) if _pd.notna(row["成交额"]) else None,
+                                    "change_pct": round(float(row["涨跌幅"]), 2) if _pd.notna(row["涨跌幅"]) else None,
                                     "type": "loser",
                                 })
 
                             # Market statistics
-                            up_count = int((df_spot["涨跌幅"] > 0).sum())
-                            down_count = int((df_spot["涨跌幅"] < 0).sum())
-                            flat_count = int((df_spot["涨跌幅"] == 0).sum())
-                            limit_up = int((df_spot["涨跌幅"] >= 9.9).sum())
-                            limit_down = int((df_spot["涨跌幅"] <= -9.9).sum())
+                            up_count = int((valid["涨跌幅"] > 0).sum())
+                            down_count = int((valid["涨跌幅"] < 0).sum())
+                            flat_count = int((valid["涨跌幅"] == 0).sum())
+                            limit_up = int((valid["涨跌幅"] >= 9.9).sum())
+                            limit_down = int((valid["涨跌幅"] <= -9.9).sum())
                             total_amount = float(df_spot["成交额"].sum()) if "成交额" in df_spot.columns else 0
 
                             market_stats = {
+                                "total_stocks": len(df_spot),
                                 "up_count": up_count,
                                 "down_count": down_count,
                                 "flat_count": flat_count,
                                 "limit_up": limit_up,
                                 "limit_down": limit_down,
                                 "total_amount_billion": round(total_amount / 1e8, 2),
-                                "avg_change_pct": round(float(df_spot["涨跌幅"].mean()), 2),
+                                "avg_change_pct": round(float(valid["涨跌幅"].mean()), 2),
+                                "median_change_pct": round(float(valid["涨跌幅"].median()), 2),
                             }
-                        else:
-                            market_stats = {}
-                    else:
-                        market_stats = {}
 
-                    log_fn(f"实时快照获取成功: {len(df_spot)} 只股票", node_id=node["id"])
+                    log_fn(f"市场统计: {market_stats.get('up_count', 0)}涨 {market_stats.get('down_count', 0)}跌 {market_stats.get('limit_up', 0)}涨停 {market_stats.get('limit_down', 0)}跌停", node_id=node["id"])
 
                 except Exception as snap_err:
                     log_fn(f"实时快照获取失败: {snap_err}", "warning", node["id"])
-                    market_stats = {}
 
                 # Also get OHLCV count from DB
                 ohlcv_result = await session.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))
@@ -642,8 +648,13 @@ async def _execute_tool_node(
                 }
 
             elif tool_name == "fetch_northbound":
+                import asyncio as _aio
                 from sqlalchemy import select, func as sqlfunc
                 from quant_os_infra_market.models.northbound_model import NorthboundFlowModel
+
+                # Delay to avoid rate limiting with parallel nodes
+                await _aio.sleep(5)
+
                 result = await session.execute(select(sqlfunc.count()).select_from(NorthboundFlowModel))
                 count = result.scalar() or 0
 
@@ -671,8 +682,13 @@ async def _execute_tool_node(
                     output = {"records": 0, "message": "北向资金数据同步失败，可能是AKShare API变更，请检查日志"}
 
             elif tool_name == "fetch_dragon_tiger":
+                import asyncio as _aio
                 from sqlalchemy import select, func as sqlfunc
                 from quant_os_infra_market.models.dragon_tiger_model import DragonTigerModel
+
+                # Delay to avoid rate limiting with parallel nodes
+                await _aio.sleep(10)
+
                 result = await session.execute(select(sqlfunc.count()).select_from(DragonTigerModel))
                 count = result.scalar() or 0
 
