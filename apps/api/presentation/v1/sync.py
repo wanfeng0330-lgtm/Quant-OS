@@ -107,79 +107,77 @@ async def _do_full_sync(db: AsyncSession) -> dict:
 
     try:
         provider = ProviderFactory.get("akshare")
-        ingestion = DataIngestionService(db, provider)
+
+        # Each step uses its own session to avoid cascade rollbacks
+        def _new_ingestion():
+            from dependencies import get_session_factory
+            factory = get_session_factory()
+            return factory, DataIngestionService.__new__(DataIngestionService)
 
         # Step 1: Stock list
         logger.info("Sync step 1/5: stock list")
         try:
-            res = await ingestion.sync_stock_list()
-            await db.commit()
-            results["stocks"] = res
-            logger.info("Stock list sync: %s", res)
+            from dependencies import get_session_factory
+            factory = get_session_factory()
+            async with factory() as step_session:
+                step_ingestion = DataIngestionService(step_session, provider)
+                res = await step_ingestion.sync_stock_list()
+                await step_session.commit()
+                results["stocks"] = res
+                logger.info("Stock list sync: %s", res)
         except Exception as e:
             logger.error("Stock list sync failed: %s", e)
             results["stocks"] = {"error": str(e)}
 
         await asyncio.sleep(2)
 
-        # Step 2: Northbound flow
+        # Step 2: Northbound flow (own session)
         logger.info("Sync step 2/5: northbound flow")
         try:
-            res = await ingestion.sync_northbound_flow()
-            await db.commit()
-            results["northbound"] = res
-            logger.info("Northbound sync: %s", res)
+            async with factory() as step_session:
+                step_ingestion = DataIngestionService(step_session, provider)
+                res = await step_ingestion.sync_northbound_flow()
+                await step_session.commit()
+                results["northbound"] = res
+                logger.info("Northbound sync: %s", res)
         except Exception as e:
             logger.error("Northbound sync failed: %s", e)
             results["northbound"] = {"error": str(e)}
 
         await asyncio.sleep(2)
 
-        # Step 3: Dragon tiger
+        # Step 3: Dragon tiger (own session)
         logger.info("Sync step 3/5: dragon tiger")
         try:
-            res = await ingestion.sync_dragon_tiger()
-            await db.commit()
-            results["dragon_tiger"] = res
-            logger.info("Dragon tiger sync: %s", res)
+            async with factory() as step_session:
+                step_ingestion = DataIngestionService(step_session, provider)
+                res = await step_ingestion.sync_dragon_tiger()
+                await step_session.commit()
+                results["dragon_tiger"] = res
+                logger.info("Dragon tiger sync: %s", res)
         except Exception as e:
             logger.error("Dragon tiger sync failed: %s", e)
             results["dragon_tiger"] = {"error": str(e)}
 
         await asyncio.sleep(2)
 
-        # Step 4: Industry boards
-        logger.info("Sync step 4/5: industry boards")
+        # Step 4: OHLCV for sample stocks (own session per stock)
+        logger.info("Sync step 4/5: OHLCV sample data")
         try:
-            res = await ingestion.sync_sector_classification()
-            await db.commit()
-            results["sectors"] = res
-            logger.info("Sector sync: %s", res)
-        except Exception as e:
-            logger.error("Sector sync failed: %s", e)
-            results["sectors"] = {"error": str(e)}
-
-        await asyncio.sleep(2)
-
-        # Step 5: OHLCV for top stocks (limited to avoid timeout)
-        logger.info("Sync step 5/5: OHLCV sample data")
-        try:
-            from quant_os_infra_market.models.stock_model import StockModel
-            from sqlalchemy import select as sa_select
-
-            # Get a sample of important stocks to sync OHLCV
             sample_codes = ["000001.SZ", "600519.SH", "000858.SZ", "601318.SH", "000333.SZ"]
             synced = 0
             for code in sample_codes:
                 try:
-                    res = await ingestion.sync_ohlcv_daily(ts_code=code)
-                    synced += 1
-                    logger.info("OHLCV sync for %s: %s", code, res)
+                    async with factory() as step_session:
+                        step_ingestion = DataIngestionService(step_session, provider)
+                        res = await step_ingestion.sync_ohlcv_daily(ts_code=code)
+                        await step_session.commit()
+                        synced += 1
+                        logger.info("OHLCV sync for %s: %s", code, res)
                 except Exception as e:
                     logger.warning("OHLCV sync failed for %s: %s", code, e)
                 await asyncio.sleep(1)
 
-            await db.commit()
             results["ohlcv"] = {"synced_stocks": synced, "total_attempted": len(sample_codes)}
         except Exception as e:
             logger.error("OHLCV sync failed: %s", e)

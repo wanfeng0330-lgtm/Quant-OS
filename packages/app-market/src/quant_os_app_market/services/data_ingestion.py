@@ -178,15 +178,19 @@ class DataIngestionService:
             trade_date = r.get("trade_date")
             if not trade_date:
                 continue
+            # Fix nan values - ts_code can be NaN from DataFrame None
+            ts_code = r.get("ts_code")
+            if ts_code is not None and str(ts_code) == "nan":
+                ts_code = None
             model = NorthboundFlowModel(
                 trade_date=trade_date,
-                ts_code=r.get("ts_code"),
+                ts_code=str(ts_code) if ts_code else None,
                 channel=r.get("channel", "all"),
-                buy_amount=r.get("buy_amount"),
-                sell_amount=r.get("sell_amount"),
-                net_amount=r.get("net_amount"),
-                hold_volume=r.get("hold_volume"),
-                hold_ratio=r.get("hold_ratio"),
+                buy_amount=r.get("buy_amount") if str(r.get("buy_amount")) != "nan" else None,
+                sell_amount=r.get("sell_amount") if str(r.get("sell_amount")) != "nan" else None,
+                net_amount=r.get("net_amount") if str(r.get("net_amount")) != "nan" else None,
+                hold_volume=r.get("hold_volume") if str(r.get("hold_volume")) != "nan" else None,
+                hold_ratio=r.get("hold_ratio") if str(r.get("hold_ratio")) != "nan" else None,
             )
             self._session.add(model)
             inserted += 1
