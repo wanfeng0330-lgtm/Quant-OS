@@ -79,10 +79,14 @@ async def init_database() -> None:
         import quant_os_infra_strategy.models.strategy_model
         import quant_os_infra_agent.models.agent_model
 
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            logger.info("Database tables created")
+        except Exception as exc:
+            logger.error("Failed to create database tables: %s", exc)
+            raise
 
-        logger.info("Database tables created")
         _db_initialized = True
 
 
