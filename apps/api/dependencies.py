@@ -54,18 +54,13 @@ def get_engine():
 
 
 async def init_database() -> None:
-    """Initialize database tables for SQLite (auto-create)."""
+    """Initialize database tables (auto-create for all backends)."""
     global _db_initialized
     if _db_initialized:
         return
 
     async with _db_init_lock:
         if _db_initialized:
-            return
-
-        settings = get_app_settings()
-        if not settings.database.is_sqlite:
-            _db_initialized = True
             return
 
         engine = get_engine()
@@ -87,7 +82,7 @@ async def init_database() -> None:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
-        logger.info("SQLite database tables created")
+        logger.info("Database tables created")
         _db_initialized = True
 
 
