@@ -18,10 +18,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger = __import__("structlog").get_logger("api")
     logger.info("Starting AI Quant Research OS API")
 
-    # Initialize data providers
-    from quant_os_infra_market.providers import init_providers_from_settings
-    settings = app.state.settings
-    init_providers_from_settings(settings)
+    # Initialize data providers (non-fatal if it fails)
+    try:
+        from quant_os_infra_market.providers import init_providers_from_settings
+        settings = app.state.settings
+        init_providers_from_settings(settings)
+    except Exception as e:
+        logger.warning("Failed to initialize data providers: %s", e)
 
     yield
     logger.info("Shutting down AI Quant Research OS API")
@@ -64,6 +67,11 @@ def create_app() -> FastAPI:
 
     # Routers
     app.include_router(api_router)
+
+    # Simple root health check for Railway (no DB dependency)
+    @app.get("/health")
+    async def root_health():
+        return {"status": "ok"}
 
     return app
 
