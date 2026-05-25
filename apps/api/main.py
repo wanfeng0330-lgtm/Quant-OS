@@ -74,19 +74,6 @@ def create_app() -> FastAPI:
     async def root_health():
         return {"status": "ok"}
 
-    # Database connection test
-    @app.get("/db-test")
-    async def db_test():
-        from dependencies import get_engine
-        from sqlalchemy import text
-        try:
-            engine = get_engine()
-            async with engine.connect() as conn:
-                result = await conn.execute(text("SELECT 1"))
-                return {"status": "ok", "result": result.scalar()}
-        except Exception as exc:
-            return {"status": "error", "error": str(exc), "type": type(exc).__name__}
-
     return app
 
 
