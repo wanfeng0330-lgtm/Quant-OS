@@ -149,6 +149,16 @@ function _connectWs(
 
   ws.onopen = () => {
     set({ ws })
+    // Check if workflow already completed (race condition: events broadcast before WS connected)
+    workflowApi.getWorkflowRun(runId).then((res) => {
+      if (res.data.success && res.data.data) {
+        const run = res.data.data
+        if (run.status === 'completed' || run.status === 'failed') {
+          ws.close()
+          _handleCompletion(run, runId, set, get, progressMsgId, startedAt)
+        }
+      }
+    }).catch(() => {})
   }
 
   ws.onmessage = (event) => {
@@ -187,57 +197,7 @@ function _connectWs(
         // Fetch final run state
         workflowApi.getWorkflowRun(runId).then((res) => {
           if (res.data.success && res.data.data) {
-            const run = res.data.data
-            const finalStatus = run.status === 'completed' ? 'completed' : 'failed'
-
-            // If no report message was received, extract from node_results
-            if (finalStatus === 'completed') {
-              const currentState = get()
-              const hasReport = currentState.messages.some((m) => m.role === 'report')
-              if (!hasReport) {
-                let reportContent = ''
-                for (const [nid, result] of Object.entries(run.node_results || {})) {
-                  if (nid.includes('report')) {
-                    const output = result.output
-                    if (typeof output === 'string') {
-                      reportContent = output
-                    } else if (output && typeof output === 'object') {
-                      reportContent = output.output || output.content || JSON.stringify(output)
-                    }
-                  }
-                }
-                if (reportContent) {
-                  const durationMs = Date.now() - startedAt
-                  const reportMsg: ChatMessage = {
-                    id: nextId(),
-                    role: 'report',
-                    content: reportContent,
-                    timestamp: new Date().toISOString(),
-                    reportMetadata: {
-                      duration_ms: durationMs,
-                      nodes_executed: Object.keys(run.node_results || {}).length,
-                      generated_at: new Date().toISOString(),
-                    },
-                  }
-                  set((s) => ({ messages: [...s.messages, reportMsg] }))
-                }
-              }
-            }
-
-            // Update progress message to final state
-            set((s) => ({
-              isRunning: false,
-              currentRunId: null,
-              messages: s.messages.map((m) =>
-                m.id === progressMsgId
-                  ? {
-                      ...m,
-                      workflowStatus: finalStatus,
-                      content: finalStatus === 'completed' ? '研究完成' : '研究执行失败',
-                    }
-                  : m
-              ),
-            }))
+            _handleCompletion(res.data.data, runId, set, get, progressMsgId, startedAt)
           }
         })
         return
@@ -317,6 +277,71 @@ function _connectWs(
   ws.onclose = () => {
     set({ ws: null })
   }
+}
+
+// ---------------------------------------------------------------------------
+// Completion handler (shared by onopen check and done event)
+// ---------------------------------------------------------------------------
+
+function _handleCompletion(
+  run: any,
+  _runId: string,
+  set: (partial: Partial<ChatState> | ((state: ChatState) => Partial<ChatState>)) => void,
+  get: () => ChatState,
+  progressMsgId: string,
+  startedAt: number,
+) {
+  const finalStatus = run.status === 'completed' ? 'completed' : 'failed'
+
+  // If no report message was received, extract from node_results
+  if (finalStatus === 'completed') {
+    const currentState = get()
+    const hasReport = currentState.messages.some((m) => m.role === 'report')
+    if (!hasReport) {
+      let reportContent = ''
+      for (const [nid, result] of Object.entries(run.node_results || {})) {
+        if (nid.includes('report')) {
+          const output = (result as any).output
+          if (typeof output === 'string') {
+            reportContent = output
+          } else if (output && typeof output === 'object') {
+            reportContent = output.output || output.content || JSON.stringify(output)
+          }
+        }
+      }
+      if (reportContent) {
+        const durationMs = Date.now() - startedAt
+        const reportMsg: ChatMessage = {
+          id: nextId(),
+          role: 'report',
+          content: reportContent,
+          timestamp: new Date().toISOString(),
+          reportMetadata: {
+            duration_ms: durationMs,
+            nodes_executed: Object.keys(run.node_results || {}).length,
+            generated_at: new Date().toISOString(),
+          },
+        }
+        set((s) => ({ messages: [...s.messages, reportMsg] }))
+      }
+    }
+  }
+
+  // Update progress message to final state
+  set((s) => ({
+    isRunning: false,
+    currentRunId: null,
+    ws: null,
+    messages: s.messages.map((m) =>
+      m.id === progressMsgId
+        ? {
+            ...m,
+            workflowStatus: finalStatus,
+            content: finalStatus === 'completed' ? '研究完成' : '研究执行失败',
+          }
+        : m
+    ),
+  }))
 }
 
 // Export node metadata for components
