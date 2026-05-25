@@ -51,7 +51,7 @@ class AKShareProvider:
         """Run a synchronous function with rate limiting and retry on connection errors."""
         global _last_call_time
         for attempt in range(max_retries):
-            # Rate limiting
+            # Rate limiting: ensure minimum gap between calls
             now = time.monotonic()
             elapsed = now - _last_call_time
             if elapsed < _RATE_LIMIT_INTERVAL:
@@ -67,7 +67,7 @@ class AKShareProvider:
                     "connectionerror", "timeout", "toomanyrequests",
                 ))
                 if is_retryable and attempt < max_retries - 1:
-                    wait = 2 ** (attempt + 1)
+                    wait = 5 * (attempt + 1)  # 5s, 10s, 15s
                     logger.warning("AKShare call failed (attempt %d/%d), retrying in %ds: %s",
                                    attempt + 1, max_retries, wait, e)
                     await asyncio.sleep(wait)

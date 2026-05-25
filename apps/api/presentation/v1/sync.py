@@ -129,7 +129,7 @@ async def _do_full_sync(db: AsyncSession) -> dict:
             logger.error("Stock list sync failed: %s", e)
             results["stocks"] = {"error": str(e)}
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(10)
 
         # Step 2: Northbound flow (own session)
         logger.info("Sync step 2/5: northbound flow")
@@ -144,7 +144,7 @@ async def _do_full_sync(db: AsyncSession) -> dict:
             logger.error("Northbound sync failed: %s", e)
             results["northbound"] = {"error": str(e)}
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
 
         # Step 3: Dragon tiger (own session)
         logger.info("Sync step 3/5: dragon tiger")
@@ -159,11 +159,9 @@ async def _do_full_sync(db: AsyncSession) -> dict:
             logger.error("Dragon tiger sync failed: %s", e)
             results["dragon_tiger"] = {"error": str(e)}
 
-        await asyncio.sleep(2)
-
         # Step 4: OHLCV - use market snapshot (all stocks at once) instead of per-stock
-        logger.info("Sync step 4/5: OHLCV market snapshot")
-        await asyncio.sleep(5)
+        logger.info("Sync step 4/5: OHLCV market snapshot (waiting 30s cooldown)")
+        await asyncio.sleep(30)
         try:
             import akshare as ak
             import pandas as _pd
@@ -173,7 +171,7 @@ async def _do_full_sync(db: AsyncSession) -> dict:
                 from quant_os_infra_market.repositories.ohlcv_repo import OHLCVRepository
 
                 logger.info("Fetching market snapshot for OHLCV...")
-                df = await provider._run_with_retry(ak.stock_zh_a_spot_em)
+                df = await provider._run_with_retry(ak.stock_zh_a_spot_em, max_retries=5)
 
                 if not df.empty:
                     today = datetime.now().date()
