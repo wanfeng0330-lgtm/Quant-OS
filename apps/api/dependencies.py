@@ -87,6 +87,17 @@ async def init_database() -> None:
             logger.error("Failed to create database tables: %s", exc)
             raise
 
+        # Simple migration: add missing columns to existing tables
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    __import__("sqlalchemy").text(
+                        "ALTER TABLE dragon_tiger_list ADD COLUMN IF NOT EXISTS name VARCHAR(50)"
+                    )
+                )
+        except Exception:
+            pass  # Column may already exist or SQLite doesn't support IF NOT EXISTS
+
         _db_initialized = True
 
 

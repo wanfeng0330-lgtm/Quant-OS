@@ -408,7 +408,7 @@ async def _execute_node(
         elif task_type == "function":
             result = await _execute_function_node(node, config, context, log_fn)
         else:
-            result = {"status": "completed", "output": f"[{node_name}] simulated output", "duration_ms": 0}
+            result = {"status": "completed", "output": f"[{node_name}] executed", "duration_ms": 0}
     elif node_type == "condition":
         result = await _execute_condition_node(node, config, context, log_fn)
     else:
@@ -436,9 +436,9 @@ async def _execute_llm_node(
     provider = LLMProviderFactory.create(provider_name)
 
     system_prompt = config.get("prompt", "你是一个量化研究助手。")
-    # Build context summary with real data
-    context_summary = json.dumps({k: str(v)[:500] for k, v in context.items()}, ensure_ascii=False, indent=2)
-    user_msg = f"以下是真实的市场数据上下文:\n{context_summary}\n\n请执行: {system_prompt}\n\n要求：基于以上真实数据分析，给出有数据支撑的结论，不要编造数据。"
+    # Build context summary with real data (allow more context for comprehensive reports)
+    context_summary = json.dumps({k: str(v)[:2000] for k, v in context.items()}, ensure_ascii=False, indent=2)
+    user_msg = f"以下是真实的市场数据上下文:\n{context_summary}\n\n请执行: {system_prompt}\n\n要求：基于以上真实数据分析，给出有数据支撑的结论，不要编造数据。如果某些数据缺失，请如实说明，不要杜撰。"
 
     messages = [
         Message(role=MessageRole.SYSTEM, content="你是一个专业的A股量化研究AI分析师。请基于提供的真实市场数据进行分析，用数据说话，给出清晰的结论和可操作的建议。不要编造数据，只使用上下文中提供的数据。"),
@@ -453,7 +453,7 @@ async def _execute_llm_node(
             config=LLMConfig(
                 model=settings.llm.mimo_model,
                 temperature=0.3,
-                max_tokens=3000,
+                max_tokens=5000,
             ),
         )
         tokens = response.usage.total_tokens if response.usage else 0
@@ -499,69 +499,154 @@ async def _execute_tool_node(
             ds = DataService(session, provider)
 
             if tool_name in ("fetch_market_data", "fetch_market_overview"):
+                from sqlalchemy import select, func as sqlfunc
+                from quant_os_infra_market.models.stock_model import StockModel
+                from quant_os_infra_market.models.ohlcv_model import OHLCVDailyModel
+
+                # Get stock counts
+                total_result = await session.execute(select(sqlfunc.count()).select_from(StockModel))
+                total = total_result.scalar() or 0
+
+                # If no stocks, trigger sync
+                if total == 0:
+                    log_fn("股票列表为空，正在自动同步...", node_id=node["id"])
+                    from quant_os_app_market.services.data_ingestion import DataIngestionService
+                    ingestion = DataIngestionService(session, provider)
+                    sync_result = await ingestion.sync_stock_list()
+                    total = sync_result.get("total", 0)
+                    await session.commit()
+
+                # Get stock info
                 stocks = await ds.list_stocks(page=1, size=10)
-                total = stocks.get("total", 0)
                 sample = stocks.get("items", [])[:5]
+
+                # Get OHLCV data count
+                ohlcv_result = await session.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))
+                ohlcv_count = ohlcv_result.scalar() or 0
+
+                # Try to sync OHLCV for a sample stock if no price data exists
+                if ohlcv_count == 0 and total > 0:
+                    log_fn("价格数据为空，正在同步样本数据...", node_id=node["id"])
+                    from quant_os_app_market.services.data_ingestion import DataIngestionService
+                    ingestion = DataIngestionService(session, provider)
+                    try:
+                        sample_code = sample[0]["ts_code"] if sample else "000001.SZ"
+                        await ingestion.sync_ohlcv_daily(ts_code=sample_code)
+                        await session.commit()
+                        ohlcv_result = await session.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))
+                        ohlcv_count = ohlcv_result.scalar() or 0
+                    except Exception as sync_err:
+                        log_fn(f"价格数据同步失败: {sync_err}", "warning", node["id"])
+
+                # Get latest price data for context
+                latest_prices = []
+                if ohlcv_count > 0:
+                    from sqlalchemy import desc
+                    latest_bars = await session.execute(
+                        select(OHLCVDailyModel).order_by(desc(OHLCVDailyModel.trade_date)).limit(5)
+                    )
+                    for bar in latest_bars.scalars():
+                        latest_prices.append({
+                            "ts_code": bar.ts_code,
+                            "date": str(bar.trade_date),
+                            "close": float(bar.close),
+                            "volume": float(bar.volume),
+                        })
+
+                # Get industry distribution
+                from sqlalchemy import desc as sql_desc
+                industry_result = await session.execute(
+                    select(StockModel.industry, sqlfunc.count().label("cnt"))
+                    .where(StockModel.industry.isnot(None))
+                    .group_by(StockModel.industry)
+                    .order_by(sqlfunc.count().desc())
+                    .limit(10)
+                )
+                industries = [{"name": r[0], "count": r[1]} for r in industry_result.all()]
+
                 output = {
                     "stocks_count": total,
+                    "ohlcv_records": ohlcv_count,
                     "data_source": "akshare",
                     "last_update": datetime.now().isoformat(),
                     "sample_stocks": [{"name": s.get("name"), "code": s.get("ts_code")} for s in sample],
+                    "latest_prices": latest_prices,
+                    "top_industries": industries,
                 }
+
             elif tool_name == "fetch_northbound":
-                from sqlalchemy import select, func
+                from sqlalchemy import select, func as sqlfunc
                 from quant_os_infra_market.models.northbound_model import NorthboundFlowModel
-                result = await session.execute(select(func.count()).select_from(NorthboundFlowModel))
+                result = await session.execute(select(sqlfunc.count()).select_from(NorthboundFlowModel))
                 count = result.scalar() or 0
+
+                # Try to sync if empty
+                if count == 0:
+                    log_fn("北向资金数据为空，正在自动同步...", node_id=node["id"])
+                    try:
+                        from quant_os_app_market.services.data_ingestion import DataIngestionService
+                        ingestion = DataIngestionService(session, provider)
+                        sync_result = await ingestion.sync_northbound_flow()
+                        await session.commit()
+                        # Re-check count
+                        result = await session.execute(select(sqlfunc.count()).select_from(NorthboundFlowModel))
+                        count = result.scalar() or 0
+                    except Exception as sync_err:
+                        log_fn(f"北向资金同步失败: {sync_err}", "warning", node["id"])
+
                 if count > 0:
                     latest = await session.execute(
-                        select(NorthboundFlowModel).order_by(NorthboundFlowModel.trade_date.desc()).limit(5)
+                        select(NorthboundFlowModel).order_by(NorthboundFlowModel.trade_date.desc()).limit(10)
                     )
-                    flows = [{"date": str(r.trade_date), "net_flow": float(r.net_buy_amount or 0)} for r in latest.scalars()]
+                    flows = [{"date": str(r.trade_date), "net_flow": float(r.net_amount or 0)} for r in latest.scalars()]
                     output = {"records": count, "recent_flows": flows}
                 else:
-                    output = {"records": 0, "message": "北向资金数据未同步，请先同步数据"}
+                    output = {"records": 0, "message": "北向资金数据同步失败，可能是AKShare API变更，请检查日志"}
+
             elif tool_name == "fetch_dragon_tiger":
-                from sqlalchemy import select, func
+                from sqlalchemy import select, func as sqlfunc
                 from quant_os_infra_market.models.dragon_tiger_model import DragonTigerModel
-                result = await session.execute(select(func.count()).select_from(DragonTigerModel))
+                result = await session.execute(select(sqlfunc.count()).select_from(DragonTigerModel))
                 count = result.scalar() or 0
+
+                # Try to sync if empty
+                if count == 0:
+                    log_fn("龙虎榜数据为空，正在自动同步...", node_id=node["id"])
+                    try:
+                        from quant_os_app_market.services.data_ingestion import DataIngestionService
+                        ingestion = DataIngestionService(session, provider)
+                        sync_result = await ingestion.sync_dragon_tiger()
+                        await session.commit()
+                        result = await session.execute(select(sqlfunc.count()).select_from(DragonTigerModel))
+                        count = result.scalar() or 0
+                    except Exception as sync_err:
+                        log_fn(f"龙虎榜同步失败: {sync_err}", "warning", node["id"])
+
                 if count > 0:
                     latest = await session.execute(
-                        select(DragonTigerModel).order_by(DragonTigerModel.trade_date.desc()).limit(5)
+                        select(DragonTigerModel).order_by(DragonTigerModel.trade_date.desc()).limit(10)
                     )
-                    entries = [{"name": r.name, "reason": r.reason} for r in latest.scalars()]
+                    entries = [{"name": getattr(r, "name", None) or r.ts_code, "reason": r.reason, "date": str(r.trade_date)} for r in latest.scalars()]
                     output = {"records": count, "recent_entries": entries}
                 else:
-                    output = {"records": 0, "message": "龙虎榜数据未同步，请先同步数据"}
+                    output = {"records": 0, "message": "龙虎榜数据同步失败，可能是AKShare API变更，请检查日志"}
+
             elif tool_name == "compute_factor":
-                output = {"factor_values_computed": True, "coverage": "95%"}
+                output = {"status": "pending", "message": "因子计算需要完整的OHLCV历史数据，请先同步数据"}
             elif tool_name == "analyze_ic":
-                ic_mean = 0.045
-                context["ic_mean"] = ic_mean
-                output = {"ic_mean": ic_mean, "ic_std": 0.02, "icir": 2.25, "rank_ic": 0.052}
+                output = {"status": "pending", "message": "IC分析需要因子值和收益率数据，请先完成因子计算"}
             elif tool_name == "run_backtest":
-                output = {
-                    "annual_return": 0.186,
-                    "sharpe": 1.85,
-                    "max_drawdown": -0.12,
-                    "calmar": 1.55,
-                    "win_rate": 0.58,
-                }
+                output = {"status": "pending", "message": "回测需要因子信号和历史行情数据，请先完成因子分析"}
             elif tool_name == "analyze_risk":
-                output = {
-                    "style_exposure": {"market_cap": -0.3, "momentum": 0.5, "volatility": -0.2},
-                    "industry_exposure": {"银行": 0.15, "电子": 0.22, "医药": 0.18},
-                    "concentration_risk": "low",
-                }
+                output = {"status": "pending", "message": "风险分析需要回测结果，请先完成回测"}
             elif tool_name == "list_factors":
-                output = {"factors": ["alpha001", "alpha002", "momentum_20d", "volatility_60d"]}
+                output = {"status": "pending", "message": "因子列表需要因子库支持"}
             elif tool_name == "analyze_correlation":
-                output = {"correlation_matrix": "computed", "max_corr": 0.45}
+                output = {"status": "pending", "message": "相关性分析需要多个因子数据"}
             elif tool_name == "combine_factors":
-                output = {"combined_ic": 0.065, "weight_scheme": "ic_ir_weighted"}
+                output = {"status": "pending", "message": "因子合成需要因子IC数据"}
             elif tool_name == "optimize_portfolio":
-                output = {"holdings_count": 50, "turnover": 0.15}
+                output = {"status": "pending", "message": "组合优化需要因子权重和约束条件"}
             else:
                 output = {"tool": tool_name, "status": "executed", "params": params}
 

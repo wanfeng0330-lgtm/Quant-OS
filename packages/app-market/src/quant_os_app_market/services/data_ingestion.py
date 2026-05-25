@@ -159,6 +159,8 @@ class DataIngestionService:
         end_date: date | None = None,
     ) -> dict[str, Any]:
         """Sync northbound capital flow data."""
+        from quant_os_infra_market.models.northbound_model import NorthboundFlowModel
+
         logger.info("Starting northbound flow sync")
 
         df = await self._provider.fetch_northbound_flow(
@@ -170,7 +172,28 @@ class DataIngestionService:
         if df.empty:
             return {"inserted": 0, "message": "No data"}
 
-        return {"fetched": len(df), "provider": self._provider.provider_name}
+        records = df.to_dict("records")
+        inserted = 0
+        for r in records:
+            trade_date = r.get("trade_date")
+            if not trade_date:
+                continue
+            model = NorthboundFlowModel(
+                trade_date=trade_date,
+                ts_code=r.get("ts_code"),
+                channel=r.get("channel", "all"),
+                buy_amount=r.get("buy_amount"),
+                sell_amount=r.get("sell_amount"),
+                net_amount=r.get("net_amount"),
+                hold_volume=r.get("hold_volume"),
+                hold_ratio=r.get("hold_ratio"),
+            )
+            self._session.add(model)
+            inserted += 1
+
+        await self._session.flush()
+        logger.info("Northbound flow sync complete: %d inserted", inserted)
+        return {"inserted": inserted, "provider": self._provider.provider_name}
 
     async def sync_dragon_tiger(
         self,
@@ -179,6 +202,8 @@ class DataIngestionService:
         end_date: date | None = None,
     ) -> dict[str, Any]:
         """Sync dragon-tiger list data."""
+        from quant_os_infra_market.models.dragon_tiger_model import DragonTigerModel
+
         logger.info("Starting dragon-tiger sync")
 
         df = await self._provider.fetch_dragon_tiger(
@@ -190,7 +215,30 @@ class DataIngestionService:
         if df.empty:
             return {"inserted": 0, "message": "No data"}
 
-        return {"fetched": len(df), "provider": self._provider.provider_name}
+        records = df.to_dict("records")
+        inserted = 0
+        for r in records:
+            ts_code = r.get("ts_code")
+            trade_date_val = r.get("trade_date")
+            if not ts_code or not trade_date_val:
+                continue
+            model = DragonTigerModel(
+                ts_code=str(ts_code),
+                name=str(r.get("name", ""))[:50] if r.get("name") else None,
+                trade_date=trade_date_val,
+                reason=str(r.get("reason", ""))[:200] if r.get("reason") else None,
+                buy_amount=r.get("buy_amount"),
+                sell_amount=r.get("sell_amount"),
+                net_amount=r.get("net_amount"),
+                broker_name=str(r.get("broker_name", ""))[:200] if r.get("broker_name") else None,
+                broker_type=r.get("broker_type", "buy"),
+            )
+            self._session.add(model)
+            inserted += 1
+
+        await self._session.flush()
+        logger.info("Dragon-tiger sync complete: %d inserted", inserted)
+        return {"inserted": inserted, "provider": self._provider.provider_name}
 
     async def sync_sector_classification(self) -> dict[str, Any]:
         """Sync sector/industry classification."""
@@ -210,6 +258,10 @@ class DataIngestionService:
         if missing:
             raise DataSyncError(f"OHLCV data missing columns: {missing}")
 
+        # Ensure ts_code is always a clean string (NaN from DataFrame -> float)
+        df = df[df["ts_code"].notna()]
+        df["ts_code"] = df["ts_code"].astype(str)
+        df = df[df["ts_code"] != "nan"]
         df = df.dropna(subset=["close"])
         df = df[df["close"] > 0]
         df = df[df["volume"] >= 0]

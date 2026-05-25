@@ -52,7 +52,7 @@ async def get_northbound_flow(db: AsyncSession = Depends(get_db_session)) -> dic
             flows = [
                 {
                     "date": str(r.trade_date),
-                    "net_flow_billion": float(r.net_buy_amount or 0) / 1e8,
+                    "net_flow_billion": float(r.net_amount or 0) / 1e8,
                 }
                 for r in latest.scalars()
             ]
@@ -86,7 +86,7 @@ async def get_dragon_tiger(db: AsyncSession = Depends(get_db_session)) -> dict:
             entries = [
                 {
                     "ts_code": r.ts_code,
-                    "name": r.name,
+                    "name": getattr(r, "name", None) or r.ts_code,
                     "reason": r.reason,
                     "date": str(r.trade_date),
                 }

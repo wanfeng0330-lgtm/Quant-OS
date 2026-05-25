@@ -1,7 +1,7 @@
 import axios from 'axios'
 
 const apiClient = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || '/api',
+  baseURL: 'https://quant-os-production.up.railway.app/api',
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json',

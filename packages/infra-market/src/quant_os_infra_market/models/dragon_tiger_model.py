@@ -16,6 +16,7 @@ class DragonTigerModel(TimestampMixin, Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     ts_code: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    name: Mapped[str | None] = mapped_column(String(50), nullable=True)
     trade_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
     buy_amount: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)

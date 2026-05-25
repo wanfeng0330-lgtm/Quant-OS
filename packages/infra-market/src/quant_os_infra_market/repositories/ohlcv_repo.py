@@ -62,6 +62,12 @@ class OHLCVRepository:
 
         inserted = 0
         for record in records:
+            # Ensure proper types (DataFrame NaN can produce floats for string columns)
+            ts_code = str(record["ts_code"]).strip()
+            if not ts_code or ts_code == "nan":
+                continue
+            record["ts_code"] = ts_code
+
             existing = await self._session.execute(
                 select(OHLCVDailyModel)
                 .where(OHLCVDailyModel.ts_code == record["ts_code"])

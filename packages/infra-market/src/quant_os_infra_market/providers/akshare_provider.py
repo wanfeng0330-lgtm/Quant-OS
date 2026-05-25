@@ -410,16 +410,17 @@ class AKShareProvider:
 
             result = pd.DataFrame()
             result["ts_code"] = df["代码"].apply(self._to_ts_code)
-            result["trade_date"] = pd.to_datetime(df["上榜日期"], errors="coerce").dt.date
-            result["reason"] = df.get("解读", "")
+            result["name"] = df.get("名称", "")
+            result["trade_date"] = pd.to_datetime(df["上榜日"], errors="coerce").dt.date
+            result["reason"] = df.get("上榜原因", df.get("解读", ""))
             result["buy_amount"] = pd.to_numeric(
-                df.get("买入额", pd.Series(dtype=float)), errors="coerce"
+                df.get("龙虎榜买入额", df.get("买入额", pd.Series(dtype=float))), errors="coerce"
             )
             result["sell_amount"] = pd.to_numeric(
-                df.get("卖出额", pd.Series(dtype=float)), errors="coerce"
+                df.get("龙虎榜卖出额", df.get("卖出额", pd.Series(dtype=float))), errors="coerce"
             )
             result["net_amount"] = pd.to_numeric(
-                df.get("净买额", pd.Series(dtype=float)), errors="coerce"
+                df.get("龙虎榜净买额", df.get("净买额", pd.Series(dtype=float))), errors="coerce"
             )
             result["broker_name"] = df.get("营业部名称", "")
             result["broker_type"] = "buy"
@@ -442,7 +443,7 @@ class AKShareProvider:
         - When ``ts_code`` is given, fetches individual stock flow via
           ``ak.stock_hsgt_individual_em``.
         - Otherwise fetches aggregate northbound net flow via
-          ``ak.stock_hsgt_north_net_flow_in_em``.
+          ``ak.stock_hsgt_hist_em(symbol='北向资金')``.
         """
         import akshare as ak
 
@@ -452,7 +453,7 @@ class AKShareProvider:
                 df = await self._run_with_retry(ak.stock_hsgt_individual_em, symbol=symbol)
             else:
                 df = await self._run_with_retry(
-                    ak.stock_hsgt_north_net_flow_in_em, symbol="北上"
+                    ak.stock_hsgt_hist_em, symbol="北向资金"
                 )
 
             if df.empty:
@@ -468,6 +469,8 @@ class AKShareProvider:
                 result["net_amount"] = pd.to_numeric(
                     df.get("当日净流入", df.iloc[:, 1]), errors="coerce"
                 )
+                result["buy_amount"] = None
+                result["sell_amount"] = None
             else:
                 result["ts_code"] = None
                 result["trade_date"] = pd.to_datetime(
@@ -475,11 +478,15 @@ class AKShareProvider:
                 ).dt.date
                 result["channel"] = "all"
                 result["net_amount"] = pd.to_numeric(
-                    df.get("当日净流入", df.iloc[:, 1]), errors="coerce"
+                    df.get("当日成交净买额", df.iloc[:, 1]), errors="coerce"
+                )
+                result["buy_amount"] = pd.to_numeric(
+                    df.get("买入成交额", pd.Series(dtype=float)), errors="coerce"
+                )
+                result["sell_amount"] = pd.to_numeric(
+                    df.get("卖出成交额", pd.Series(dtype=float)), errors="coerce"
                 )
 
-            result["buy_amount"] = None
-            result["sell_amount"] = None
             result["hold_volume"] = None
             result["hold_ratio"] = None
 
