@@ -155,8 +155,8 @@ function _connectWs(
   set: (partial: Partial<WorkflowState> | ((state: WorkflowState) => Partial<WorkflowState>)) => void,
   _get: () => WorkflowState,
 ) {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const wsUrl = `${protocol}//${window.location.hostname}:8001/ws/workflow/${runId}`
+  const wsBaseUrl = import.meta.env.VITE_WS_URL || 'wss://quant-os-production.up.railway.app'
+  const wsUrl = `${wsBaseUrl}/ws/workflow/${runId}`
   const ws = new WebSocket(wsUrl)
 
   ws.onopen = () => {
