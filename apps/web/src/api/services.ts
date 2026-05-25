@@ -258,3 +258,13 @@ export const systemApi = {
   healthCheck: () =>
     apiClient.get<ApiResponse<{ status: string; components: Record<string, any> }>>('/v1/system/health'),
 }
+
+// Data Sync API
+export const syncApi = {
+  getStatus: () =>
+    apiClient.get<ApiResponse<any>>('/v1/sync/status'),
+  triggerSync: () =>
+    apiClient.post<ApiResponse<any>>('/v1/sync/all'),
+  runSyncNow: () =>
+    apiClient.post<ApiResponse<any>>('/v1/sync/run'),
+}

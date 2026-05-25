@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter
 
-from presentation.v1 import market, factors, backtest, agents, system, workflows, reports, sentiment, research
+from presentation.v1 import market, factors, backtest, agents, system, workflows, reports, sentiment, research, sync
 from presentation.ws import workflow_stream, event_stream
 
 api_router = APIRouter()
@@ -16,6 +16,7 @@ api_router.include_router(workflows.router, prefix="/api/v1/workflows", tags=["W
 api_router.include_router(reports.router, prefix="/api/v1/reports", tags=["Research Reports"])
 api_router.include_router(sentiment.router, prefix="/api/v1/sentiment", tags=["Market Sentiment"])
 api_router.include_router(research.router, prefix="/api/v1/research", tags=["AI Research"])
+api_router.include_router(sync.router, prefix="/api/v1/sync", tags=["Data Sync"])
 
 # WebSocket routes
 api_router.include_router(workflow_stream.router, tags=["WebSocket"])

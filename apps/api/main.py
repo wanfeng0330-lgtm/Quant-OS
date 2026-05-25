@@ -27,7 +27,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as e:
         logger.warning("Failed to initialize data providers: %s", e)
 
+    # Start daily sync scheduler
+    import asyncio
+    from presentation.v1.sync import scheduled_daily_sync
+    scheduler_task = asyncio.create_task(scheduled_daily_sync())
+    logger.info("Daily data sync scheduler started")
+
     yield
+
+    scheduler_task.cancel()
     logger.info("Shutting down AI Quant Research OS API")
 
 

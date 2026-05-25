@@ -494,8 +494,7 @@ async def _execute_tool_node(
             ds = DataService(session, provider)
 
             if tool_name == "sync_all_market_data":
-                # Single sequential sync node - fetches ALL data with delays between calls
-                import asyncio as _aio
+                # Read all data from database (pre-synced by scheduled sync job)
                 from sqlalchemy import select, func as sqlfunc, desc as sql_desc
                 from quant_os_infra_market.models.stock_model import StockModel
                 from quant_os_infra_market.models.northbound_model import NorthboundFlowModel
@@ -504,40 +503,13 @@ async def _execute_tool_node(
 
                 result_data = {}
 
-                # Step 1: Stock list
-                total_result = await session.execute(select(sqlfunc.count()).select_from(StockModel))
-                total = total_result.scalar() or 0
-                if total == 0:
-                    log_fn("股票列表为空，正在同步...", node_id=node["id"])
-                    from quant_os_app_market.services.data_ingestion import DataIngestionService
-                    ingestion = DataIngestionService(session, provider)
-                    await ingestion.sync_stock_list()
-                    await session.commit()
-                    total_result = await session.execute(select(sqlfunc.count()).select_from(StockModel))
-                    total = total_result.scalar() or 0
+                # Stock count
+                total = (await session.execute(select(sqlfunc.count()).select_from(StockModel))).scalar() or 0
                 result_data["stocks_count"] = total
-                log_fn(f"股票列表: {total} 只", node_id=node["id"])
+                log_fn(f"数据库: {total} 只股票", node_id=node["id"])
 
-                # Step 2: Northbound flow
-                await _aio.sleep(2)
-                nb_result = await session.execute(select(sqlfunc.count()).select_from(NorthboundFlowModel))
-                nb_count = nb_result.scalar() or 0
-                if nb_count == 0:
-                    log_fn("北向资金为空，正在同步...", node_id=node["id"])
-                    try:
-                        from quant_os_app_market.services.data_ingestion import DataIngestionService
-                        ingestion = DataIngestionService(session, provider)
-                        sync_res = await ingestion.sync_northbound_flow()
-                        await session.commit()
-                        nb_result = await session.execute(select(sqlfunc.count()).select_from(NorthboundFlowModel))
-                        nb_count = nb_result.scalar() or 0
-                        log_fn(f"北向资金同步完成: {nb_count} 条", node_id=node["id"])
-                    except Exception as e:
-                        log_fn(f"北向资金同步失败: {e}", "warning", node["id"])
-                else:
-                    log_fn(f"北向资金已有 {nb_count} 条记录", node_id=node["id"])
-
-                # Read northbound data for context
+                # Northbound flow
+                nb_count = (await session.execute(select(sqlfunc.count()).select_from(NorthboundFlowModel))).scalar() or 0
                 if nb_count > 0:
                     latest_nb = await session.execute(
                         select(NorthboundFlowModel).order_by(NorthboundFlowModel.trade_date.desc()).limit(10)
@@ -546,27 +518,13 @@ async def _execute_tool_node(
                         {"date": str(r.trade_date), "net_flow_billion": round(float(r.net_amount or 0) / 1e8, 2)}
                         for r in latest_nb.scalars()
                     ]
-
-                # Step 3: Dragon tiger
-                await _aio.sleep(2)
-                dt_result = await session.execute(select(sqlfunc.count()).select_from(DragonTigerModel))
-                dt_count = dt_result.scalar() or 0
-                if dt_count == 0:
-                    log_fn("龙虎榜为空，正在同步...", node_id=node["id"])
-                    try:
-                        from quant_os_app_market.services.data_ingestion import DataIngestionService
-                        ingestion = DataIngestionService(session, provider)
-                        sync_res = await ingestion.sync_dragon_tiger()
-                        await session.commit()
-                        dt_result = await session.execute(select(sqlfunc.count()).select_from(DragonTigerModel))
-                        dt_count = dt_result.scalar() or 0
-                        log_fn(f"龙虎榜同步完成: {dt_count} 条", node_id=node["id"])
-                    except Exception as e:
-                        log_fn(f"龙虎榜同步失败: {e}", "warning", node["id"])
+                    log_fn(f"北向资金: {nb_count} 条记录", node_id=node["id"])
                 else:
-                    log_fn(f"龙虎榜已有 {dt_count} 条记录", node_id=node["id"])
+                    result_data["northbound_flows"] = []
+                    log_fn("北向资金: 无数据，请先执行数据同步", "warning", node["id"])
 
-                # Read dragon tiger data for context
+                # Dragon tiger
+                dt_count = (await session.execute(select(sqlfunc.count()).select_from(DragonTigerModel))).scalar() or 0
                 if dt_count > 0:
                     latest_dt = await session.execute(
                         select(DragonTigerModel).order_by(DragonTigerModel.trade_date.desc()).limit(10)
@@ -575,238 +533,17 @@ async def _execute_tool_node(
                         {"name": getattr(r, "name", None) or r.ts_code, "reason": r.reason, "date": str(r.trade_date)}
                         for r in latest_dt.scalars()
                     ]
+                    log_fn(f"龙虎榜: {dt_count} 条记录", node_id=node["id"])
+                else:
+                    result_data["dragon_tiger_entries"] = []
+                    log_fn("龙虎榜: 无数据，请先执行数据同步", "warning", node["id"])
 
-                # Step 4: Market snapshot (lightweight - just industry boards)
-                await _aio.sleep(2)
-                market_stats = {}
-                industry_counts = {}
-                live_snapshot = []
-                try:
-                    import akshare as ak
-                    import pandas as _pd
-
-                    log_fn("正在获取行业板块数据...", node_id=node["id"])
-                    df_boards = await provider._run_with_retry(ak.stock_board_industry_name_em)
-
-                    if not df_boards.empty:
-                        log_fn(f"获取到 {len(df_boards)} 个行业板块", node_id=node["id"])
-                        # Industry board columns: 板块名称, 板块代码, 最新价, 涨跌幅, 涨跌额, 总市值, 换手率, 上涨家数, 下跌家数, 领涨股票, 领涨涨跌幅
-                        for col in ["板块名称", "涨跌幅", "换手率", "上涨家数", "下跌家数", "领涨股票"]:
-                            if col not in df_boards.columns:
-                                log_fn(f"缺少列: {col}, 可用列: {list(df_boards.columns)}", "warning", node["id"])
-
-                        if "涨跌幅" in df_boards.columns:
-                            df_boards["涨跌幅"] = _pd.to_numeric(df_boards["涨跌幅"], errors="coerce")
-
-                            # Top industries by change
-                            top_ind = df_boards.nlargest(10, "涨跌幅")
-                            for _, row in top_ind.iterrows():
-                                name = str(row.get("板块名称", ""))
-                                chg = float(row["涨跌幅"]) if _pd.notna(row["涨跌幅"]) else 0
-                                up = int(row.get("上涨家数", 0)) if "上涨家数" in df_boards.columns and _pd.notna(row.get("上涨家数")) else 0
-                                down = int(row.get("下跌家数", 0)) if "下跌家数" in df_boards.columns and _pd.notna(row.get("下跌家数")) else 0
-                                industry_counts[name] = {"change_pct": round(chg, 2), "up": up, "down": down}
-
-                            # Market summary from board data
-                            total_up = 0
-                            total_down = 0
-                            if "上涨家数" in df_boards.columns:
-                                total_up = int(_pd.to_numeric(df_boards["上涨家数"], errors="coerce").sum())
-                            if "下跌家数" in df_boards.columns:
-                                total_down = int(_pd.to_numeric(df_boards["下跌家数"], errors="coerce").sum())
-
-                            market_stats = {
-                                "total_boards": len(df_boards),
-                                "boards_up": int((df_boards["涨跌幅"] > 0).sum()),
-                                "boards_down": int((df_boards["涨跌幅"] < 0).sum()),
-                                "stocks_up": total_up,
-                                "stocks_down": total_down,
-                                "avg_board_change": round(float(df_boards["涨跌幅"].mean()), 2),
-                            }
-
-                    log_fn(f"行业板块: {market_stats.get('boards_up', 0)}涨 {market_stats.get('boards_down', 0)}跌, 个股: {market_stats.get('stocks_up', 0)}涨 {market_stats.get('stocks_down', 0)}跌", node_id=node["id"])
-
-                except Exception as e:
-                    log_fn(f"行业板块获取失败: {e}", "warning", node["id"])
-
-                # Step 5: Try to get market snapshot (top movers) - optional, may fail
-                await _aio.sleep(2)
-                try:
-                    import akshare as ak
-                    import pandas as _pd
-
-                    log_fn("正在获取全市场行情快照...", node_id=node["id"])
-                    df_spot = await provider._run_with_retry(ak.stock_zh_a_spot_em)
-
-                    if not df_spot.empty and "涨跌幅" in df_spot.columns:
-                        df_spot["涨跌幅"] = _pd.to_numeric(df_spot["涨跌幅"], errors="coerce")
-                        df_spot["最新价"] = _pd.to_numeric(df_spot["最新价"], errors="coerce")
-                        df_spot["成交额"] = _pd.to_numeric(df_spot["成交额"], errors="coerce")
-                        valid = df_spot.dropna(subset=["涨跌幅"])
-
-                        # Top 5 gainers
-                        for _, row in valid.nlargest(5, "涨跌幅").iterrows():
-                            live_snapshot.append({
-                                "code": str(row.get("代码", "")),
-                                "name": str(row.get("名称", "")),
-                                "price": float(row["最新价"]) if _pd.notna(row["最新价"]) else None,
-                                "change_pct": round(float(row["涨跌幅"]), 2),
-                                "type": "gainer",
-                            })
-                        # Top 5 losers
-                        for _, row in valid.nsmallest(5, "涨跌幅").iterrows():
-                            live_snapshot.append({
-                                "code": str(row.get("代码", "")),
-                                "name": str(row.get("名称", "")),
-                                "price": float(row["最新价"]) if _pd.notna(row["最新价"]) else None,
-                                "change_pct": round(float(row["涨跌幅"]), 2),
-                                "type": "loser",
-                            })
-
-                        # Update market stats with precise data
-                        total_amount = float(df_spot["成交额"].sum()) if "成交额" in df_spot.columns else 0
-                        market_stats.update({
-                            "total_stocks": len(df_spot),
-                            "up_count": int((valid["涨跌幅"] > 0).sum()),
-                            "down_count": int((valid["涨跌幅"] < 0).sum()),
-                            "limit_up": int((valid["涨跌幅"] >= 9.9).sum()),
-                            "limit_down": int((valid["涨跌幅"] <= -9.9).sum()),
-                            "total_amount_billion": round(total_amount / 1e8, 2),
-                            "avg_change_pct": round(float(valid["涨跌幅"].mean()), 2),
-                        })
-
-                        # Update industry from spot data if available
-                        for col_name in ["板块", "所属行业", "行业"]:
-                            if col_name in df_spot.columns:
-                                ind_counts = df_spot[col_name].value_counts().head(15)
-                                for k, v in ind_counts.items():
-                                    if str(k) not in industry_counts:
-                                        industry_counts[str(k)] = {"stock_count": int(v)}
-                                break
-
-                        log_fn(f"全市场快照: {market_stats.get('up_count', 0)}涨 {market_stats.get('down_count', 0)}跌 涨停{market_stats.get('limit_up', 0)} 跌停{market_stats.get('limit_down', 0)} 成交{market_stats.get('total_amount_billion', 0)}亿", node_id=node["id"])
-                    else:
-                        log_fn("全市场快照数据为空或缺少涨跌幅列", "warning", node["id"])
-
-                except Exception as e:
-                    log_fn(f"全市场快照获取失败（非致命）: {e}", "warning", node["id"])
-
-                result_data["market_stats"] = market_stats
-                result_data["top_industries"] = industry_counts
-                result_data["top_movers"] = live_snapshot
-                result_data["data_source"] = "akshare"
-                result_data["last_update"] = datetime.now().isoformat()
-
-                output = result_data
-
-            elif tool_name in ("fetch_market_data", "fetch_market_overview"):
-                from sqlalchemy import select, func as sqlfunc
-                from quant_os_infra_market.models.stock_model import StockModel
-                from quant_os_infra_market.models.ohlcv_model import OHLCVDailyModel
-
-                # Get stock counts from DB
-                total_result = await session.execute(select(sqlfunc.count()).select_from(StockModel))
-                total = total_result.scalar() or 0
-
-                # If no stocks, trigger sync
-                if total == 0:
-                    log_fn("股票列表为空，正在自动同步...", node_id=node["id"])
-                    from quant_os_app_market.services.data_ingestion import DataIngestionService
-                    ingestion = DataIngestionService(session, provider)
-                    sync_result = await ingestion.sync_stock_list()
-                    total = sync_result.get("total", 0)
-                    await session.commit()
-
-                # Fetch live market snapshot from AKShare
-                live_snapshot = []
-                industry_counts = {}
-                market_stats = {}
-                try:
-                    import akshare as ak
-                    import pandas as _pd
-                    import asyncio as _aio
-
-                    # Add delay to avoid rate limiting when running in parallel with other nodes
-                    await _aio.sleep(3)
-
-                    log_fn("正在获取实时行情快照...", node_id=node["id"])
-                    df_spot = await provider._run_with_retry(ak.stock_zh_a_spot_em)
-
-                    if not df_spot.empty:
-                        log_fn(f"实时快照获取成功: {len(df_spot)} 只股票", node_id=node["id"])
-
-                        # Build industry distribution
-                        for col_name in ["板块", "所属行业", "行业"]:
-                            if col_name in df_spot.columns:
-                                ind_counts = df_spot[col_name].value_counts().head(15)
-                                industry_counts = {str(k): int(v) for k, v in ind_counts.items()}
-                                break
-
-                        # Get top gainers and losers
-                        if "涨跌幅" in df_spot.columns:
-                            df_spot["涨跌幅"] = _pd.to_numeric(df_spot["涨跌幅"], errors="coerce")
-                            df_spot["最新价"] = _pd.to_numeric(df_spot["最新价"], errors="coerce")
-                            df_spot["成交额"] = _pd.to_numeric(df_spot["成交额"], errors="coerce")
-
-                            valid = df_spot.dropna(subset=["涨跌幅"])
-
-                            # Top 5 gainers
-                            top_gain = valid.nlargest(5, "涨跌幅")
-                            for _, row in top_gain.iterrows():
-                                live_snapshot.append({
-                                    "code": str(row.get("代码", "")),
-                                    "name": str(row.get("名称", "")),
-                                    "price": float(row["最新价"]) if _pd.notna(row["最新价"]) else None,
-                                    "change_pct": round(float(row["涨跌幅"]), 2) if _pd.notna(row["涨跌幅"]) else None,
-                                    "type": "gainer",
-                                })
-
-                            # Top 5 losers
-                            top_lose = valid.nsmallest(5, "涨跌幅")
-                            for _, row in top_lose.iterrows():
-                                live_snapshot.append({
-                                    "code": str(row.get("代码", "")),
-                                    "name": str(row.get("名称", "")),
-                                    "price": float(row["最新价"]) if _pd.notna(row["最新价"]) else None,
-                                    "change_pct": round(float(row["涨跌幅"]), 2) if _pd.notna(row["涨跌幅"]) else None,
-                                    "type": "loser",
-                                })
-
-                            # Market statistics
-                            up_count = int((valid["涨跌幅"] > 0).sum())
-                            down_count = int((valid["涨跌幅"] < 0).sum())
-                            flat_count = int((valid["涨跌幅"] == 0).sum())
-                            limit_up = int((valid["涨跌幅"] >= 9.9).sum())
-                            limit_down = int((valid["涨跌幅"] <= -9.9).sum())
-                            total_amount = float(df_spot["成交额"].sum()) if "成交额" in df_spot.columns else 0
-
-                            market_stats = {
-                                "total_stocks": len(df_spot),
-                                "up_count": up_count,
-                                "down_count": down_count,
-                                "flat_count": flat_count,
-                                "limit_up": limit_up,
-                                "limit_down": limit_down,
-                                "total_amount_billion": round(total_amount / 1e8, 2),
-                                "avg_change_pct": round(float(valid["涨跌幅"].mean()), 2),
-                                "median_change_pct": round(float(valid["涨跌幅"].median()), 2),
-                            }
-
-                    log_fn(f"市场统计: {market_stats.get('up_count', 0)}涨 {market_stats.get('down_count', 0)}跌 {market_stats.get('limit_up', 0)}涨停 {market_stats.get('limit_down', 0)}跌停", node_id=node["id"])
-
-                except Exception as snap_err:
-                    log_fn(f"实时快照获取失败: {snap_err}", "warning", node["id"])
-
-                # Also get OHLCV count from DB
-                ohlcv_result = await session.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))
-                ohlcv_count = ohlcv_result.scalar() or 0
-
-                # Get latest OHLCV data from DB for additional context
+                # OHLCV data
+                ohlcv_count = (await session.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))).scalar() or 0
                 latest_prices = []
                 if ohlcv_count > 0:
-                    from sqlalchemy import desc
                     latest_bars = await session.execute(
-                        select(OHLCVDailyModel).order_by(desc(OHLCVDailyModel.trade_date)).limit(5)
+                        select(OHLCVDailyModel).order_by(sql_desc(OHLCVDailyModel.trade_date)).limit(10)
                     )
                     for bar in latest_bars.scalars():
                         latest_prices.append({
@@ -814,98 +551,78 @@ async def _execute_tool_node(
                             "date": str(bar.trade_date),
                             "close": float(bar.close),
                             "volume": float(bar.volume),
+                            "pct_chg": float(bar.pct_chg) if bar.pct_chg else None,
+                        })
+                    log_fn(f"OHLCV: {ohlcv_count} 条记录", node_id=node["id"])
+                result_data["latest_prices"] = latest_prices
+
+                # Industry distribution from stock list
+                industry_result = await session.execute(
+                    select(StockModel.industry, sqlfunc.count().label("cnt"))
+                    .where(StockModel.industry.isnot(None))
+                    .group_by(StockModel.industry)
+                    .order_by(sqlfunc.count().desc())
+                    .limit(15)
+                )
+                industries = [{"name": r[0], "count": r[1]} for r in industry_result.all()]
+                result_data["top_industries"] = industries
+
+                result_data["market_stats"] = {"note": "实时行情数据需通过数据同步获取"}
+                result_data["data_source"] = "database"
+                result_data["last_update"] = datetime.now().isoformat()
+
+                output = result_data
+
+            elif tool_name in ("fetch_market_data", "fetch_market_overview"):
+                # Read from pre-synced database
+                from sqlalchemy import select, func as sqlfunc, desc as sql_desc
+                from quant_os_infra_market.models.stock_model import StockModel
+                from quant_os_infra_market.models.ohlcv_model import OHLCVDailyModel
+
+                total = (await session.execute(select(sqlfunc.count()).select_from(StockModel))).scalar() or 0
+                ohlcv_count = (await session.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))).scalar() or 0
+
+                latest_prices = []
+                if ohlcv_count > 0:
+                    latest_bars = await session.execute(
+                        select(OHLCVDailyModel).order_by(sql_desc(OHLCVDailyModel.trade_date)).limit(5)
+                    )
+                    for bar in latest_bars.scalars():
+                        latest_prices.append({
+                            "ts_code": bar.ts_code, "date": str(bar.trade_date),
+                            "close": float(bar.close), "volume": float(bar.volume),
                         })
 
-                # Get sample stocks
-                stocks = await ds.list_stocks(page=1, size=5)
-                sample = stocks.get("items", [])[:5]
-
-                # Build industry list from snapshot or DB
-                industries = []
-                if industry_counts:
-                    industries = [{"name": k, "count": v} for k, v in industry_counts.items()]
-                else:
-                    # Fallback: query DB
-                    from sqlalchemy import desc as sql_desc
-                    industry_result = await session.execute(
-                        select(StockModel.industry, sqlfunc.count().label("cnt"))
-                        .where(StockModel.industry.isnot(None))
-                        .group_by(StockModel.industry)
-                        .order_by(sqlfunc.count().desc())
-                        .limit(10)
-                    )
-                    industries = [{"name": r[0], "count": r[1]} for r in industry_result.all()]
+                industry_result = await session.execute(
+                    select(StockModel.industry, sqlfunc.count().label("cnt"))
+                    .where(StockModel.industry.isnot(None))
+                    .group_by(StockModel.industry).order_by(sqlfunc.count().desc()).limit(10)
+                )
+                industries = [{"name": r[0], "count": r[1]} for r in industry_result.all()]
 
                 output = {
-                    "stocks_count": total,
-                    "ohlcv_records": ohlcv_count,
-                    "data_source": "akshare",
-                    "last_update": datetime.now().isoformat(),
-                    "market_stats": market_stats,
-                    "top_movers": live_snapshot,
-                    "sample_stocks": [{"name": s.get("name"), "code": s.get("ts_code")} for s in sample],
-                    "latest_prices": latest_prices,
-                    "top_industries": industries,
+                    "stocks_count": total, "ohlcv_records": ohlcv_count,
+                    "data_source": "database", "last_update": datetime.now().isoformat(),
+                    "latest_prices": latest_prices, "top_industries": industries,
                 }
 
             elif tool_name == "fetch_northbound":
-                import asyncio as _aio
                 from sqlalchemy import select, func as sqlfunc
                 from quant_os_infra_market.models.northbound_model import NorthboundFlowModel
-
-                # Delay to avoid rate limiting with parallel nodes
-                await _aio.sleep(5)
-
-                result = await session.execute(select(sqlfunc.count()).select_from(NorthboundFlowModel))
-                count = result.scalar() or 0
-
-                # Try to sync if empty
-                if count == 0:
-                    log_fn("北向资金数据为空，正在自动同步...", node_id=node["id"])
-                    try:
-                        from quant_os_app_market.services.data_ingestion import DataIngestionService
-                        ingestion = DataIngestionService(session, provider)
-                        sync_result = await ingestion.sync_northbound_flow()
-                        await session.commit()
-                        # Re-check count
-                        result = await session.execute(select(sqlfunc.count()).select_from(NorthboundFlowModel))
-                        count = result.scalar() or 0
-                    except Exception as sync_err:
-                        log_fn(f"北向资金同步失败: {sync_err}", "warning", node["id"])
-
+                count = (await session.execute(select(sqlfunc.count()).select_from(NorthboundFlowModel))).scalar() or 0
                 if count > 0:
                     latest = await session.execute(
                         select(NorthboundFlowModel).order_by(NorthboundFlowModel.trade_date.desc()).limit(10)
                     )
-                    flows = [{"date": str(r.trade_date), "net_flow": float(r.net_amount or 0)} for r in latest.scalars()]
+                    flows = [{"date": str(r.trade_date), "net_flow_billion": round(float(r.net_amount or 0) / 1e8, 2)} for r in latest.scalars()]
                     output = {"records": count, "recent_flows": flows}
                 else:
-                    output = {"records": 0, "message": "北向资金数据同步失败，可能是AKShare API变更，请检查日志"}
+                    output = {"records": 0, "message": "北向资金数据为空，请先通过数据同步功能获取"}
 
             elif tool_name == "fetch_dragon_tiger":
-                import asyncio as _aio
                 from sqlalchemy import select, func as sqlfunc
                 from quant_os_infra_market.models.dragon_tiger_model import DragonTigerModel
-
-                # Delay to avoid rate limiting with parallel nodes
-                await _aio.sleep(10)
-
-                result = await session.execute(select(sqlfunc.count()).select_from(DragonTigerModel))
-                count = result.scalar() or 0
-
-                # Try to sync if empty
-                if count == 0:
-                    log_fn("龙虎榜数据为空，正在自动同步...", node_id=node["id"])
-                    try:
-                        from quant_os_app_market.services.data_ingestion import DataIngestionService
-                        ingestion = DataIngestionService(session, provider)
-                        sync_result = await ingestion.sync_dragon_tiger()
-                        await session.commit()
-                        result = await session.execute(select(sqlfunc.count()).select_from(DragonTigerModel))
-                        count = result.scalar() or 0
-                    except Exception as sync_err:
-                        log_fn(f"龙虎榜同步失败: {sync_err}", "warning", node["id"])
-
+                count = (await session.execute(select(sqlfunc.count()).select_from(DragonTigerModel))).scalar() or 0
                 if count > 0:
                     latest = await session.execute(
                         select(DragonTigerModel).order_by(DragonTigerModel.trade_date.desc()).limit(10)
@@ -913,7 +630,7 @@ async def _execute_tool_node(
                     entries = [{"name": getattr(r, "name", None) or r.ts_code, "reason": r.reason, "date": str(r.trade_date)} for r in latest.scalars()]
                     output = {"records": count, "recent_entries": entries}
                 else:
-                    output = {"records": 0, "message": "龙虎榜数据同步失败，可能是AKShare API变更，请检查日志"}
+                    output = {"records": 0, "message": "龙虎榜数据为空，请先通过数据同步功能获取"}
 
             elif tool_name == "compute_factor":
                 output = {"status": "pending", "message": "因子计算需要完整的OHLCV历史数据，请先同步数据"}
