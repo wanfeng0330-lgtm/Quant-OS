@@ -52,6 +52,11 @@ export default function Chat() {
 
   return (
     <div className="h-full flex flex-col">
+      {/* Sync status bar */}
+      <div className="shrink-0 border-b border-gray-800/80 px-4 py-2">
+        <DataSyncStatus />
+      </div>
+
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto">
         {isEmpty ? (

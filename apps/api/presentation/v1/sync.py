@@ -161,36 +161,56 @@ async def _do_full_sync(db: AsyncSession) -> dict:
 
         await asyncio.sleep(2)
 
-        # Step 4: OHLCV for sample stocks (own session per stock, longer delay)
-        logger.info("Sync step 4/5: OHLCV sample data")
-        await asyncio.sleep(5)  # Extra cooldown after previous AKShare calls
+        # Step 4: OHLCV - use market snapshot (all stocks at once) instead of per-stock
+        logger.info("Sync step 4/5: OHLCV market snapshot")
+        await asyncio.sleep(5)
         try:
-            sample_codes = ["000001.SZ", "600519.SH", "000858.SZ", "601318.SH", "000333.SZ"]
-            synced = 0
-            errors = []
-            for code in sample_codes:
-                for attempt in range(2):  # Retry once per stock
-                    try:
-                        async with factory() as step_session:
-                            step_ingestion = DataIngestionService(step_session, provider)
-                            res = await step_ingestion.sync_ohlcv_daily(ts_code=code)
-                            await step_session.commit()
-                            synced += 1
-                            logger.info("OHLCV sync for %s: %s", code, res)
-                            break
-                    except Exception as e:
-                        if attempt == 0:
-                            logger.warning("OHLCV sync failed for %s, retrying: %s", code, e)
-                            await asyncio.sleep(5)
-                        else:
-                            errors.append(f"{code}: {str(e)[:200]}")
-                            logger.warning("OHLCV sync failed for %s: %s", code, e)
-                await asyncio.sleep(3)
+            import akshare as ak
+            import pandas as _pd
 
-            results["ohlcv"] = {"synced_stocks": synced, "total_attempted": len(sample_codes), "errors": errors}
+            async with factory() as step_session:
+                from quant_os_infra_market.models.ohlcv_model import OHLCVDailyModel
+                from quant_os_infra_market.repositories.ohlcv_repo import OHLCVRepository
+
+                logger.info("Fetching market snapshot for OHLCV...")
+                df = await provider._run_with_retry(ak.stock_zh_a_spot_em)
+
+                if not df.empty:
+                    today = datetime.now().date()
+                    repo = OHLCVRepository(step_session)
+
+                    # Convert snapshot to OHLCV records
+                    records = []
+                    for _, row in df.iterrows():
+                        ts_code = provider._to_ts_code(str(row.get("代码", "")))
+                        close = _pd.to_numeric(row.get("最新价"), errors="coerce")
+                        if _pd.isna(close) or close <= 0:
+                            continue
+                        records.append({
+                            "ts_code": ts_code,
+                            "trade_date": today,
+                            "open": float(_pd.to_numeric(row.get("今开"), errors="coerce") or close),
+                            "high": float(_pd.to_numeric(row.get("最高"), errors="coerce") or close),
+                            "low": float(_pd.to_numeric(row.get("最低"), errors="coerce") or close),
+                            "close": float(close),
+                            "volume": float(_pd.to_numeric(row.get("成交量"), errors="coerce") or 0),
+                            "amount": float(_pd.to_numeric(row.get("成交额"), errors="coerce") or 0),
+                            "pct_chg": float(_pd.to_numeric(row.get("涨跌幅"), errors="coerce") or 0),
+                            "pre_close": float(_pd.to_numeric(row.get("昨收"), errors="coerce") or close),
+                        })
+
+                    if records:
+                        inserted = await repo.bulk_insert(records)
+                        await step_session.commit()
+                        logger.info("OHLCV snapshot: %d records inserted for %s", inserted, today)
+                        results["ohlcv"] = {"inserted": inserted, "date": str(today), "source": "market_snapshot"}
+                    else:
+                        results["ohlcv"] = {"inserted": 0, "message": "No valid records in snapshot"}
+                else:
+                    results["ohlcv"] = {"inserted": 0, "message": "Market snapshot empty"}
         except Exception as e:
-            logger.error("OHLCV sync failed: %s", e)
-            results["ohlcv"] = {"error": str(e)}
+            logger.error("OHLCV snapshot sync failed: %s", e)
+            results["ohlcv"] = {"error": str(e)[:300]}
 
         duration = (datetime.now() - started).total_seconds()
         _sync_state["last_run"] = datetime.now().isoformat()
