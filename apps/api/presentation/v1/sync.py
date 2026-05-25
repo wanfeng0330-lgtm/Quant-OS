@@ -163,17 +163,71 @@ async def _do_full_sync(db: AsyncSession) -> dict:
         logger.info("Sync step 4/5: OHLCV market snapshot (waiting 30s cooldown)")
         await asyncio.sleep(30)
         try:
-            import akshare as ak
             import pandas as _pd
 
+            # Use direct HTTP to EastMoney API (bypasses AKShare session issues)
             async with factory() as step_session:
                 from quant_os_infra_market.models.ohlcv_model import OHLCVDailyModel
                 from quant_os_infra_market.repositories.ohlcv_repo import OHLCVRepository
 
-                logger.info("Fetching market snapshot for OHLCV...")
-                df = await provider._run_with_retry(ak.stock_zh_a_spot_em, max_retries=5)
+                logger.info("Fetching market snapshot for OHLCV via direct HTTP...")
 
-                if not df.empty:
+                loop = asyncio.get_event_loop()
+                def _fetch_snapshot():
+                    import requests
+                    url = "https://82.push2.eastmoney.com/api/qt/clist/get"
+                    params = {
+                        "pn": 1, "pz": 6000, "po": 1, "np": 1,
+                        "fltt": 2, "invt": 2, "fid": "f3",
+                        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
+                        "fields": "f2,f3,f4,f5,f6,f7,f8,f12,f14,f15,f16,f17,f18",
+                    }
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Referer": "https://quote.eastmoney.com/",
+                    }
+                    sess = requests.Session()
+                    resp = sess.get(url, params=params, headers=headers, timeout=30)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    items = data.get("data", {}).get("diff", [])
+                    if not items:
+                        return _pd.DataFrame()
+                    rows = []
+                    for item in items:
+                        code = str(item.get("f12", ""))
+                        if not code:
+                            continue
+                        rows.append({
+                            "代码": code,
+                            "最新价": item.get("f2"),
+                            "涨跌幅": item.get("f3"),
+                            "涨跌额": item.get("f4"),
+                            "成交量": item.get("f5"),
+                            "成交额": item.get("f6"),
+                            "振幅": item.get("f7"),
+                            "换手率": item.get("f8"),
+                            "名称": item.get("f14"),
+                            "最高": item.get("f15"),
+                            "最低": item.get("f16"),
+                            "今开": item.get("f17"),
+                            "昨收": item.get("f18"),
+                        })
+                    return _pd.DataFrame(rows)
+
+                # Retry with exponential backoff
+                df = None
+                for attempt in range(5):
+                    try:
+                        df = await loop.run_in_executor(None, _fetch_snapshot)
+                        break
+                    except Exception as fetch_err:
+                        wait = 10 * (attempt + 1)
+                        logger.warning("Snapshot fetch failed (attempt %d/5), retrying in %ds: %s",
+                                       attempt + 1, wait, fetch_err)
+                        await asyncio.sleep(wait)
+
+                if df is not None and not df.empty:
                     today = datetime.now().date()
                     repo = OHLCVRepository(step_session)
 
@@ -205,7 +259,8 @@ async def _do_full_sync(db: AsyncSession) -> dict:
                     else:
                         results["ohlcv"] = {"inserted": 0, "message": "No valid records in snapshot"}
                 else:
-                    results["ohlcv"] = {"inserted": 0, "message": "Market snapshot empty"}
+                    msg = "All snapshot fetch attempts failed" if df is None else "Market snapshot empty"
+                    results["ohlcv"] = {"inserted": 0, "message": msg}
         except Exception as e:
             logger.error("OHLCV snapshot sync failed: %s", e)
             results["ohlcv"] = {"error": str(e)[:300]}
