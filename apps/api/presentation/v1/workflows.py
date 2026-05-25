@@ -87,19 +87,14 @@ RESEARCH_WORKFLOW_TEMPLATES: dict[str, dict[str, Any]] = {
         "description": "数据获取、因子探索、市场分析、情绪分析、报告生成的完整研究链路",
         "dag": {
             "nodes": [
-                # Layer 0: 并行数据获取
-                {"id": "data_fetch", "name": "数据获取与清洗", "type": "task", "config": {"type": "tool", "tool": "fetch_market_data"}, "dependencies": []},
-                {"id": "market_overview", "name": "市场概况采集", "type": "task", "config": {"type": "tool", "tool": "fetch_market_overview"}, "dependencies": []},
-                {"id": "northbound", "name": "北向资金采集", "type": "task", "config": {"type": "tool", "tool": "fetch_northbound"}, "dependencies": []},
-                {"id": "sentiment_data", "name": "情绪数据采集", "type": "task", "config": {"type": "tool", "tool": "fetch_dragon_tiger"}, "dependencies": []},
-                # Layer 1: 并行分析（依赖Layer 0）
-                {"id": "factor_discovery", "name": "因子探索与发现", "type": "task", "config": {"type": "llm", "prompt": "基于市场数据上下文，发现并评估有潜力的Alpha因子，给出因子公式和逻辑解释"}, "dependencies": ["data_fetch"]},
-                {"id": "sector_analysis", "name": "行业轮动分析", "type": "task", "config": {"type": "llm", "prompt": "分析行业轮动和板块动量，找出当前强势行业和潜在机会"}, "dependencies": ["market_overview", "northbound"]},
-                {"id": "sentiment_calc", "name": "市场情绪研判", "type": "task", "config": {"type": "llm", "prompt": "综合分析市场情绪，包括涨跌停、北向资金、龙虎榜等多维度数据，给出情绪评分和趋势判断"}, "dependencies": ["market_overview", "northbound", "sentiment_data"]},
-                # Layer 2: 因子分析（依赖Layer 1）
-                {"id": "factor_analysis", "name": "因子IC分析", "type": "task", "config": {"type": "tool", "tool": "analyze_ic"}, "dependencies": ["factor_discovery"]},
-                # Layer 3: 综合报告（依赖所有上游）
-                {"id": "report_synthesis", "name": "综合研究报告", "type": "task", "config": {"type": "llm", "prompt": "基于以上所有分析结果，生成一份完整的A股市场综合研究报告。报告格式要求：\n\n## 今日A股市场综合研究报告\n\n### 一、市场概况\n简述当前市场整体情况（基于真实股票数据）\n\n### 二、行业轮动分析\n分析哪些行业表现强势，哪些行业在走弱\n\n### 三、因子发现\n推荐有潜力的量化因子及其逻辑\n\n### 四、市场情绪研判\n当前市场情绪是偏多还是偏空，依据是什么\n\n### 五、综合结论\n用通俗易懂的语言总结今日市场状况\n\n### 六、投资建议\n给出具体可操作的建议（如关注哪些板块、注意什么风险）\n\n注意：用通俗易懂的语言，避免过多专业术语，让普通投资者也能看懂。基于真实数据分析，不要编造数据。"}, "dependencies": ["factor_analysis", "sector_analysis", "sentiment_calc"]},
+                # Layer 0: 单一数据同步节点（顺序执行所有AKShare调用，避免并行冲突）
+                {"id": "data_sync", "name": "全量数据同步", "type": "task", "config": {"type": "tool", "tool": "sync_all_market_data"}, "dependencies": []},
+                # Layer 1: 并行分析（依赖数据同步完成）
+                {"id": "factor_discovery", "name": "因子探索与发现", "type": "task", "config": {"type": "llm", "prompt": "基于市场数据上下文，发现并评估有潜力的Alpha因子，给出因子公式和逻辑解释"}, "dependencies": ["data_sync"]},
+                {"id": "sector_analysis", "name": "行业轮动分析", "type": "task", "config": {"type": "llm", "prompt": "分析行业轮动和板块动量，找出当前强势行业和潜在机会"}, "dependencies": ["data_sync"]},
+                {"id": "sentiment_calc", "name": "市场情绪研判", "type": "task", "config": {"type": "llm", "prompt": "综合分析市场情绪，包括涨跌停、北向资金、龙虎榜等多维度数据，给出情绪评分和趋势判断"}, "dependencies": ["data_sync"]},
+                # Layer 2: 综合报告（依赖所有分析完成）
+                {"id": "report_synthesis", "name": "综合研究报告", "type": "task", "config": {"type": "llm", "prompt": "基于以上所有分析结果，生成一份完整的A股市场综合研究报告。报告格式要求：\n\n## 今日A股市场综合研究报告\n\n### 一、市场概况\n简述当前市场整体情况，包括涨跌家数、涨停跌停数、总成交额等核心数据\n\n### 二、行业轮动分析\n分析哪些行业表现强势，哪些行业在走弱\n\n### 三、因子发现\n推荐有潜力的量化因子及其逻辑\n\n### 四、市场情绪研判\n当前市场情绪是偏多还是偏空，依据是什么\n\n### 五、综合结论\n用通俗易懂的语言总结今日市场状况\n\n### 六、投资建议\n给出具体可操作的建议（如关注哪些板块、注意什么风险）\n\n注意：用通俗易懂的语言，避免过多专业术语，让普通投资者也能看懂。基于真实数据分析，不要编造数据。"}, "dependencies": ["factor_discovery", "sector_analysis", "sentiment_calc"]},
             ],
         },
     },
@@ -498,7 +493,213 @@ async def _execute_tool_node(
             provider = ProviderFactory.get("akshare")
             ds = DataService(session, provider)
 
-            if tool_name in ("fetch_market_data", "fetch_market_overview"):
+            if tool_name == "sync_all_market_data":
+                # Single sequential sync node - fetches ALL data with delays between calls
+                import asyncio as _aio
+                from sqlalchemy import select, func as sqlfunc, desc as sql_desc
+                from quant_os_infra_market.models.stock_model import StockModel
+                from quant_os_infra_market.models.northbound_model import NorthboundFlowModel
+                from quant_os_infra_market.models.dragon_tiger_model import DragonTigerModel
+                from quant_os_infra_market.models.ohlcv_model import OHLCVDailyModel
+
+                result_data = {}
+
+                # Step 1: Stock list
+                total_result = await session.execute(select(sqlfunc.count()).select_from(StockModel))
+                total = total_result.scalar() or 0
+                if total == 0:
+                    log_fn("股票列表为空，正在同步...", node_id=node["id"])
+                    from quant_os_app_market.services.data_ingestion import DataIngestionService
+                    ingestion = DataIngestionService(session, provider)
+                    await ingestion.sync_stock_list()
+                    await session.commit()
+                    total_result = await session.execute(select(sqlfunc.count()).select_from(StockModel))
+                    total = total_result.scalar() or 0
+                result_data["stocks_count"] = total
+                log_fn(f"股票列表: {total} 只", node_id=node["id"])
+
+                # Step 2: Northbound flow
+                await _aio.sleep(2)
+                nb_result = await session.execute(select(sqlfunc.count()).select_from(NorthboundFlowModel))
+                nb_count = nb_result.scalar() or 0
+                if nb_count == 0:
+                    log_fn("北向资金为空，正在同步...", node_id=node["id"])
+                    try:
+                        from quant_os_app_market.services.data_ingestion import DataIngestionService
+                        ingestion = DataIngestionService(session, provider)
+                        sync_res = await ingestion.sync_northbound_flow()
+                        await session.commit()
+                        nb_result = await session.execute(select(sqlfunc.count()).select_from(NorthboundFlowModel))
+                        nb_count = nb_result.scalar() or 0
+                        log_fn(f"北向资金同步完成: {nb_count} 条", node_id=node["id"])
+                    except Exception as e:
+                        log_fn(f"北向资金同步失败: {e}", "warning", node["id"])
+                else:
+                    log_fn(f"北向资金已有 {nb_count} 条记录", node_id=node["id"])
+
+                # Read northbound data for context
+                if nb_count > 0:
+                    latest_nb = await session.execute(
+                        select(NorthboundFlowModel).order_by(NorthboundFlowModel.trade_date.desc()).limit(10)
+                    )
+                    result_data["northbound_flows"] = [
+                        {"date": str(r.trade_date), "net_flow_billion": round(float(r.net_amount or 0) / 1e8, 2)}
+                        for r in latest_nb.scalars()
+                    ]
+
+                # Step 3: Dragon tiger
+                await _aio.sleep(2)
+                dt_result = await session.execute(select(sqlfunc.count()).select_from(DragonTigerModel))
+                dt_count = dt_result.scalar() or 0
+                if dt_count == 0:
+                    log_fn("龙虎榜为空，正在同步...", node_id=node["id"])
+                    try:
+                        from quant_os_app_market.services.data_ingestion import DataIngestionService
+                        ingestion = DataIngestionService(session, provider)
+                        sync_res = await ingestion.sync_dragon_tiger()
+                        await session.commit()
+                        dt_result = await session.execute(select(sqlfunc.count()).select_from(DragonTigerModel))
+                        dt_count = dt_result.scalar() or 0
+                        log_fn(f"龙虎榜同步完成: {dt_count} 条", node_id=node["id"])
+                    except Exception as e:
+                        log_fn(f"龙虎榜同步失败: {e}", "warning", node["id"])
+                else:
+                    log_fn(f"龙虎榜已有 {dt_count} 条记录", node_id=node["id"])
+
+                # Read dragon tiger data for context
+                if dt_count > 0:
+                    latest_dt = await session.execute(
+                        select(DragonTigerModel).order_by(DragonTigerModel.trade_date.desc()).limit(10)
+                    )
+                    result_data["dragon_tiger_entries"] = [
+                        {"name": getattr(r, "name", None) or r.ts_code, "reason": r.reason, "date": str(r.trade_date)}
+                        for r in latest_dt.scalars()
+                    ]
+
+                # Step 4: Market snapshot (lightweight - just industry boards)
+                await _aio.sleep(2)
+                market_stats = {}
+                industry_counts = {}
+                live_snapshot = []
+                try:
+                    import akshare as ak
+                    import pandas as _pd
+
+                    log_fn("正在获取行业板块数据...", node_id=node["id"])
+                    df_boards = await provider._run_with_retry(ak.stock_board_industry_name_em)
+
+                    if not df_boards.empty:
+                        log_fn(f"获取到 {len(df_boards)} 个行业板块", node_id=node["id"])
+                        # Industry board columns: 板块名称, 板块代码, 最新价, 涨跌幅, 涨跌额, 总市值, 换手率, 上涨家数, 下跌家数, 领涨股票, 领涨涨跌幅
+                        for col in ["板块名称", "涨跌幅", "换手率", "上涨家数", "下跌家数", "领涨股票"]:
+                            if col not in df_boards.columns:
+                                log_fn(f"缺少列: {col}, 可用列: {list(df_boards.columns)}", "warning", node["id"])
+
+                        if "涨跌幅" in df_boards.columns:
+                            df_boards["涨跌幅"] = _pd.to_numeric(df_boards["涨跌幅"], errors="coerce")
+
+                            # Top industries by change
+                            top_ind = df_boards.nlargest(10, "涨跌幅")
+                            for _, row in top_ind.iterrows():
+                                name = str(row.get("板块名称", ""))
+                                chg = float(row["涨跌幅"]) if _pd.notna(row["涨跌幅"]) else 0
+                                up = int(row.get("上涨家数", 0)) if "上涨家数" in df_boards.columns and _pd.notna(row.get("上涨家数")) else 0
+                                down = int(row.get("下跌家数", 0)) if "下跌家数" in df_boards.columns and _pd.notna(row.get("下跌家数")) else 0
+                                industry_counts[name] = {"change_pct": round(chg, 2), "up": up, "down": down}
+
+                            # Market summary from board data
+                            total_up = 0
+                            total_down = 0
+                            if "上涨家数" in df_boards.columns:
+                                total_up = int(_pd.to_numeric(df_boards["上涨家数"], errors="coerce").sum())
+                            if "下跌家数" in df_boards.columns:
+                                total_down = int(_pd.to_numeric(df_boards["下跌家数"], errors="coerce").sum())
+
+                            market_stats = {
+                                "total_boards": len(df_boards),
+                                "boards_up": int((df_boards["涨跌幅"] > 0).sum()),
+                                "boards_down": int((df_boards["涨跌幅"] < 0).sum()),
+                                "stocks_up": total_up,
+                                "stocks_down": total_down,
+                                "avg_board_change": round(float(df_boards["涨跌幅"].mean()), 2),
+                            }
+
+                    log_fn(f"行业板块: {market_stats.get('boards_up', 0)}涨 {market_stats.get('boards_down', 0)}跌, 个股: {market_stats.get('stocks_up', 0)}涨 {market_stats.get('stocks_down', 0)}跌", node_id=node["id"])
+
+                except Exception as e:
+                    log_fn(f"行业板块获取失败: {e}", "warning", node["id"])
+
+                # Step 5: Try to get market snapshot (top movers) - optional, may fail
+                await _aio.sleep(2)
+                try:
+                    import akshare as ak
+                    import pandas as _pd
+
+                    log_fn("正在获取全市场行情快照...", node_id=node["id"])
+                    df_spot = await provider._run_with_retry(ak.stock_zh_a_spot_em)
+
+                    if not df_spot.empty and "涨跌幅" in df_spot.columns:
+                        df_spot["涨跌幅"] = _pd.to_numeric(df_spot["涨跌幅"], errors="coerce")
+                        df_spot["最新价"] = _pd.to_numeric(df_spot["最新价"], errors="coerce")
+                        df_spot["成交额"] = _pd.to_numeric(df_spot["成交额"], errors="coerce")
+                        valid = df_spot.dropna(subset=["涨跌幅"])
+
+                        # Top 5 gainers
+                        for _, row in valid.nlargest(5, "涨跌幅").iterrows():
+                            live_snapshot.append({
+                                "code": str(row.get("代码", "")),
+                                "name": str(row.get("名称", "")),
+                                "price": float(row["最新价"]) if _pd.notna(row["最新价"]) else None,
+                                "change_pct": round(float(row["涨跌幅"]), 2),
+                                "type": "gainer",
+                            })
+                        # Top 5 losers
+                        for _, row in valid.nsmallest(5, "涨跌幅").iterrows():
+                            live_snapshot.append({
+                                "code": str(row.get("代码", "")),
+                                "name": str(row.get("名称", "")),
+                                "price": float(row["最新价"]) if _pd.notna(row["最新价"]) else None,
+                                "change_pct": round(float(row["涨跌幅"]), 2),
+                                "type": "loser",
+                            })
+
+                        # Update market stats with precise data
+                        total_amount = float(df_spot["成交额"].sum()) if "成交额" in df_spot.columns else 0
+                        market_stats.update({
+                            "total_stocks": len(df_spot),
+                            "up_count": int((valid["涨跌幅"] > 0).sum()),
+                            "down_count": int((valid["涨跌幅"] < 0).sum()),
+                            "limit_up": int((valid["涨跌幅"] >= 9.9).sum()),
+                            "limit_down": int((valid["涨跌幅"] <= -9.9).sum()),
+                            "total_amount_billion": round(total_amount / 1e8, 2),
+                            "avg_change_pct": round(float(valid["涨跌幅"].mean()), 2),
+                        })
+
+                        # Update industry from spot data if available
+                        for col_name in ["板块", "所属行业", "行业"]:
+                            if col_name in df_spot.columns:
+                                ind_counts = df_spot[col_name].value_counts().head(15)
+                                for k, v in ind_counts.items():
+                                    if str(k) not in industry_counts:
+                                        industry_counts[str(k)] = {"stock_count": int(v)}
+                                break
+
+                        log_fn(f"全市场快照: {market_stats.get('up_count', 0)}涨 {market_stats.get('down_count', 0)}跌 涨停{market_stats.get('limit_up', 0)} 跌停{market_stats.get('limit_down', 0)} 成交{market_stats.get('total_amount_billion', 0)}亿", node_id=node["id"])
+                    else:
+                        log_fn("全市场快照数据为空或缺少涨跌幅列", "warning", node["id"])
+
+                except Exception as e:
+                    log_fn(f"全市场快照获取失败（非致命）: {e}", "warning", node["id"])
+
+                result_data["market_stats"] = market_stats
+                result_data["top_industries"] = industry_counts
+                result_data["top_movers"] = live_snapshot
+                result_data["data_source"] = "akshare"
+                result_data["last_update"] = datetime.now().isoformat()
+
+                output = result_data
+
+            elif tool_name in ("fetch_market_data", "fetch_market_overview"):
                 from sqlalchemy import select, func as sqlfunc
                 from quant_os_infra_market.models.stock_model import StockModel
                 from quant_os_infra_market.models.ohlcv_model import OHLCVDailyModel

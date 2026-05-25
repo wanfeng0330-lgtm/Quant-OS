@@ -7,6 +7,7 @@ import type { ChatMessage, WorkflowEvent } from '../api/types'
 // ---------------------------------------------------------------------------
 
 const NODE_NAMES: Record<string, string> = {
+  data_sync: '全量数据同步',
   data_fetch: '数据获取与清洗',
   market_overview: '市场概况采集',
   northbound: '北向资金采集',
@@ -19,6 +20,7 @@ const NODE_NAMES: Record<string, string> = {
 }
 
 const NODE_ORDER = [
+  'data_sync',
   'data_fetch',
   'market_overview',
   'northbound',
