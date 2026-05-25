@@ -129,7 +129,7 @@ async def _do_full_sync(db: AsyncSession) -> dict:
             logger.error("Stock list sync failed: %s", e)
             results["stocks"] = {"error": str(e)}
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
 
         # Step 2: Northbound flow (own session)
         logger.info("Sync step 2/5: northbound flow")
@@ -144,7 +144,7 @@ async def _do_full_sync(db: AsyncSession) -> dict:
             logger.error("Northbound sync failed: %s", e)
             results["northbound"] = {"error": str(e)}
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(5)
 
         # Step 3: Dragon tiger (own session)
         logger.info("Sync step 3/5: dragon tiger")
@@ -161,24 +161,31 @@ async def _do_full_sync(db: AsyncSession) -> dict:
 
         await asyncio.sleep(2)
 
-        # Step 4: OHLCV for sample stocks (own session per stock)
+        # Step 4: OHLCV for sample stocks (own session per stock, longer delay)
         logger.info("Sync step 4/5: OHLCV sample data")
+        await asyncio.sleep(5)  # Extra cooldown after previous AKShare calls
         try:
             sample_codes = ["000001.SZ", "600519.SH", "000858.SZ", "601318.SH", "000333.SZ"]
             synced = 0
             errors = []
             for code in sample_codes:
-                try:
-                    async with factory() as step_session:
-                        step_ingestion = DataIngestionService(step_session, provider)
-                        res = await step_ingestion.sync_ohlcv_daily(ts_code=code)
-                        await step_session.commit()
-                        synced += 1
-                        logger.info("OHLCV sync for %s: %s", code, res)
-                except Exception as e:
-                    errors.append(f"{code}: {str(e)[:200]}")
-                    logger.warning("OHLCV sync failed for %s: %s", code, e)
-                await asyncio.sleep(1)
+                for attempt in range(2):  # Retry once per stock
+                    try:
+                        async with factory() as step_session:
+                            step_ingestion = DataIngestionService(step_session, provider)
+                            res = await step_ingestion.sync_ohlcv_daily(ts_code=code)
+                            await step_session.commit()
+                            synced += 1
+                            logger.info("OHLCV sync for %s: %s", code, res)
+                            break
+                    except Exception as e:
+                        if attempt == 0:
+                            logger.warning("OHLCV sync failed for %s, retrying: %s", code, e)
+                            await asyncio.sleep(5)
+                        else:
+                            errors.append(f"{code}: {str(e)[:200]}")
+                            logger.warning("OHLCV sync failed for %s: %s", code, e)
+                await asyncio.sleep(3)
 
             results["ohlcv"] = {"synced_stocks": synced, "total_attempted": len(sample_codes), "errors": errors}
         except Exception as e:
