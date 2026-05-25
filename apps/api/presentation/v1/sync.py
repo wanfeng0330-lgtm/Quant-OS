@@ -166,6 +166,7 @@ async def _do_full_sync(db: AsyncSession) -> dict:
         try:
             sample_codes = ["000001.SZ", "600519.SH", "000858.SZ", "601318.SH", "000333.SZ"]
             synced = 0
+            errors = []
             for code in sample_codes:
                 try:
                     async with factory() as step_session:
@@ -175,10 +176,11 @@ async def _do_full_sync(db: AsyncSession) -> dict:
                         synced += 1
                         logger.info("OHLCV sync for %s: %s", code, res)
                 except Exception as e:
+                    errors.append(f"{code}: {str(e)[:200]}")
                     logger.warning("OHLCV sync failed for %s: %s", code, e)
                 await asyncio.sleep(1)
 
-            results["ohlcv"] = {"synced_stocks": synced, "total_attempted": len(sample_codes)}
+            results["ohlcv"] = {"synced_stocks": synced, "total_attempted": len(sample_codes), "errors": errors}
         except Exception as e:
             logger.error("OHLCV sync failed: %s", e)
             results["ohlcv"] = {"error": str(e)}
