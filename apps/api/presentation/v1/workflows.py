@@ -542,10 +542,12 @@ async def _execute_tool_node(
     try:
         from dependencies import get_session_factory
         from quant_os_infra_market.data_service import DataService
+        from quant_os_infra_market.providers import ProviderFactory
 
         factory = get_session_factory()
         async with factory() as session:
-            ds = DataService(session)
+            provider = ProviderFactory.get("akshare")
+            ds = DataService(session, provider)
 
             if tool_name in ("fetch_market_data", "fetch_market_overview"):
                 stocks = await ds.list_stocks(page=1, size=10)
