@@ -99,7 +99,7 @@ RESEARCH_WORKFLOW_TEMPLATES: dict[str, dict[str, Any]] = {
                 # Layer 2: 因子分析（依赖Layer 1）
                 {"id": "factor_analysis", "name": "因子IC分析", "type": "task", "config": {"type": "tool", "tool": "analyze_ic"}, "dependencies": ["factor_discovery"]},
                 # Layer 3: 综合报告（依赖所有上游）
-                {"id": "report_synthesis", "name": "综合研究报告", "type": "task", "config": {"type": "llm", "prompt": "基于以上所有分析结果，生成一份完整的A股市场综合研究报告，包含：1)市场概况 2)行业轮动分析 3)因子发现与IC分析 4)市场情绪研判 5)投资建议与风险提示。报告应结构清晰、数据详实、观点明确。"}, "dependencies": ["factor_analysis", "sector_analysis", "sentiment_calc"]},
+                {"id": "report_synthesis", "name": "综合研究报告", "type": "task", "config": {"type": "llm", "prompt": "基于以上所有分析结果，生成一份完整的A股市场综合研究报告。报告格式要求：\n\n## 今日A股市场综合研究报告\n\n### 一、市场概况\n简述当前市场整体情况（基于真实股票数据）\n\n### 二、行业轮动分析\n分析哪些行业表现强势，哪些行业在走弱\n\n### 三、因子发现\n推荐有潜力的量化因子及其逻辑\n\n### 四、市场情绪研判\n当前市场情绪是偏多还是偏空，依据是什么\n\n### 五、综合结论\n用通俗易懂的语言总结今日市场状况\n\n### 六、投资建议\n给出具体可操作的建议（如关注哪些板块、注意什么风险）\n\n注意：用通俗易懂的语言，避免过多专业术语，让普通投资者也能看懂。基于真实数据分析，不要编造数据。"}, "dependencies": ["factor_analysis", "sector_analysis", "sentiment_calc"]},
             ],
         },
     },
@@ -420,44 +420,6 @@ async def _execute_node(
     return result
 
 
-def _simulate_llm_output(prompt: str, context: dict[str, Any]) -> str:
-    """Generate simulated LLM output for when the API is unavailable."""
-    if "因子" in prompt or "Alpha" in prompt.lower():
-        return (
-            "## 候选 Alpha 因子分析\n\n"
-            "基于历史数据回测，推荐以下因子:\n\n"
-            "1. **momentum_20d** - 20日动量因子，IC均值0.042，ICIR 2.1\n"
-            "2. **volatility_60d** - 60日波动率因子，IC均值-0.035，负向有效\n"
-            "3. **turnover_ratio** - 换手率因子，IC均值0.038，小盘股效果更佳\n\n"
-            "建议: 动量+低波组合在当前市场环境下表现稳定。"
-        )
-    elif "报告" in prompt or "report" in prompt.lower():
-        return (
-            "## 量化研究报告\n\n"
-            "### 研究结论\n"
-            "当前因子组合在样本外回测中表现稳健，年化收益18.6%，"
-            "最大回撤12%，夏普比率1.85。\n\n"
-            "### 风险提示\n"
-            "- 小盘风格暴露较高\n"
-            "- 行业集中度偏高（电子、医药）\n"
-            "- 建议动态调整因子权重\n\n"
-            "### 操作建议\n"
-            "维持当前组合，逐步降低小盘暴露，增加大盘价值股配置。"
-        )
-    elif "情绪" in prompt or "sentiment" in prompt.lower():
-        return (
-            "## 市场情绪分析\n\n"
-            "当前市场情绪: **偏乐观**\n\n"
-            "- 涨停数: 45家，跌停数: 8家，多空比5.6:1\n"
-            "- 连板高度: 5板（投机情绪活跃）\n"
-            "- 北向资金: 净流入32亿\n"
-            "- 行业轮动: 科技→消费切换中\n\n"
-            "情绪周期: 上升期中期，注意短期过热风险。"
-        )
-    else:
-        return f"## 分析结果\n\n基于 {prompt} 的分析完成。\n\n上下文数据: {json.dumps({k: str(v)[:50] for k, v in context.items()}, ensure_ascii=False)}"
-
-
 async def _execute_llm_node(
     node: dict[str, Any],
     config: dict[str, Any],
@@ -474,24 +436,24 @@ async def _execute_llm_node(
     provider = LLMProviderFactory.create(provider_name)
 
     system_prompt = config.get("prompt", "你是一个量化研究助手。")
-    # Build context summary
-    context_summary = json.dumps({k: str(v)[:200] for k, v in context.items()}, ensure_ascii=False)
-    user_msg = f"研究上下文:\n{context_summary}\n\n请执行: {system_prompt}"
+    # Build context summary with real data
+    context_summary = json.dumps({k: str(v)[:500] for k, v in context.items()}, ensure_ascii=False, indent=2)
+    user_msg = f"以下是真实的市场数据上下文:\n{context_summary}\n\n请执行: {system_prompt}\n\n要求：基于以上真实数据分析，给出有数据支撑的结论，不要编造数据。"
 
     messages = [
-        Message(role=MessageRole.SYSTEM, content="你是一个专业的A股量化研究AI。简洁、准确、用数据说话。"),
+        Message(role=MessageRole.SYSTEM, content="你是一个专业的A股量化研究AI分析师。请基于提供的真实市场数据进行分析，用数据说话，给出清晰的结论和可操作的建议。不要编造数据，只使用上下文中提供的数据。"),
         Message(role=MessageRole.USER, content=user_msg),
     ]
 
-    log_fn(f"LLM调用: {provider_name}/{settings.llm.deepseek_model}", node_id=node["id"])
+    log_fn(f"LLM调用: {provider_name}/{settings.llm.mimo_model}", node_id=node["id"])
 
     try:
         response = await provider.chat(
             messages,
             config=LLMConfig(
-                model=settings.llm.deepseek_model,
+                model=settings.llm.mimo_model,
                 temperature=0.3,
-                max_tokens=2000,
+                max_tokens=3000,
             ),
         )
         tokens = response.usage.total_tokens if response.usage else 0
@@ -504,19 +466,6 @@ async def _execute_llm_node(
             "tokens": tokens,
         }
     except Exception as e:
-        # Graceful degradation: return simulated analysis when LLM is unavailable
-        error_msg = str(e)
-        if any(k in error_msg.lower() for k in ["401", "api", "bearer", "header", "auth", "key", "illegal"]):
-            log_fn(f"LLM不可用，使用模拟分析 (原因: {error_msg[:60]})", "warn", node["id"])
-            prompt = config.get("prompt", "研究分析")
-            simulated_output = _simulate_llm_output(prompt, context)
-            return {
-                "status": "completed",
-                "output": simulated_output,
-                "model": "simulated",
-                "provider": "fallback",
-                "tokens": 0,
-            }
         log_fn(f"LLM调用失败: {e}", "error", node["id"])
         return {"status": "failed", "error": str(e)}
 

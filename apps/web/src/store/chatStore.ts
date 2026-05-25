@@ -293,6 +293,21 @@ function _handleCompletion(
 ) {
   const finalStatus = run.status === 'completed' ? 'completed' : 'failed'
 
+  // Build node statuses from run results
+  const nodeStatuses: Record<string, any> = {}
+  for (const [nid, result] of Object.entries(run.node_results || {})) {
+    nodeStatuses[nid] = {
+      status: (result as any).status || 'completed',
+      output: (result as any).output,
+      error: (result as any).error,
+      duration_ms: (result as any).duration_ms,
+      model: (result as any).model,
+      provider: (result as any).provider,
+      tokens: (result as any).tokens,
+      tool: (result as any).tool,
+    }
+  }
+
   // If no report message was received, extract from node_results
   if (finalStatus === 'completed') {
     const currentState = get()
@@ -327,7 +342,7 @@ function _handleCompletion(
     }
   }
 
-  // Update progress message to final state
+  // Update progress message with node statuses and final state
   set((s) => ({
     isRunning: false,
     currentRunId: null,
@@ -338,6 +353,7 @@ function _handleCompletion(
             ...m,
             workflowStatus: finalStatus,
             content: finalStatus === 'completed' ? '研究完成' : '研究执行失败',
+            nodeStatuses: nodeStatuses,
           }
         : m
     ),
