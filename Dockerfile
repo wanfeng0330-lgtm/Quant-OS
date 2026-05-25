@@ -14,14 +14,17 @@ COPY packages/ packages/
 # Copy API app
 COPY apps/api/ apps/api/
 
+# Copy entrypoint
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 # Install dependencies (no dev deps)
 RUN uv sync --frozen --no-dev
 
 # Set working directory to API
 WORKDIR /app/apps/api
 
-# Expose port (Railway sets $PORT)
+# Expose port
 EXPOSE 8000
 
-# Run migrations then start server
-CMD ["sh", "-c", "uv run alembic upgrade head && uv run uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+ENTRYPOINT ["/entrypoint.sh"]
