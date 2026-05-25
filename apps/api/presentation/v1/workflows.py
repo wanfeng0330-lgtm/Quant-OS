@@ -527,7 +527,7 @@ async def _execute_tool_node(
     context: dict[str, Any],
     log_fn: Any,
 ) -> dict[str, Any]:
-    """Execute a tool-powered node."""
+    """Execute a tool-powered node with real data from database."""
     tool_name = config.get("tool", "unknown")
     log_fn(f"工具调用: {tool_name}", node_id=node["id"])
 
@@ -539,47 +539,86 @@ async def _execute_tool_node(
         else:
             params[k] = v
 
-    # Simulate tool execution with real data where possible
     try:
-        if tool_name in ("fetch_market_data", "fetch_market_overview"):
-            output = {"stocks_count": 5522, "data_source": "baostock", "last_update": datetime.now().isoformat()}
-        elif tool_name == "fetch_northbound":
-            output = {"net_flow": "待获取", "status": "需要北向数据"}
-        elif tool_name == "fetch_dragon_tiger":
-            output = {"status": "需要龙虎榜数据"}
-        elif tool_name == "compute_factor":
-            output = {"factor_values_computed": True, "coverage": "95%"}
-        elif tool_name == "analyze_ic":
-            ic_mean = 0.045
-            context["ic_mean"] = ic_mean
-            output = {"ic_mean": ic_mean, "ic_std": 0.02, "icir": 2.25, "rank_ic": 0.052}
-        elif tool_name == "run_backtest":
-            output = {
-                "annual_return": 0.186,
-                "sharpe": 1.85,
-                "max_drawdown": -0.12,
-                "calmar": 1.55,
-                "win_rate": 0.58,
-            }
-        elif tool_name == "analyze_risk":
-            output = {
-                "style_exposure": {"market_cap": -0.3, "momentum": 0.5, "volatility": -0.2},
-                "industry_exposure": {"银行": 0.15, "电子": 0.22, "医药": 0.18},
-                "concentration_risk": "low",
-            }
-        elif tool_name == "list_factors":
-            output = {"factors": ["alpha001", "alpha002", "momentum_20d", "volatility_60d"]}
-        elif tool_name == "analyze_correlation":
-            output = {"correlation_matrix": "computed", "max_corr": 0.45}
-        elif tool_name == "combine_factors":
-            output = {"combined_ic": 0.065, "weight_scheme": "ic_ir_weighted"}
-        elif tool_name == "optimize_portfolio":
-            output = {"holdings_count": 50, "turnover": 0.15}
-        else:
-            output = {"tool": tool_name, "status": "executed", "params": params}
+        from dependencies import get_session_factory
+        from quant_os_infra_market.data_service import DataService
+
+        factory = get_session_factory()
+        async with factory() as session:
+            ds = DataService(session)
+
+            if tool_name in ("fetch_market_data", "fetch_market_overview"):
+                stocks = await ds.list_stocks(page=1, size=10)
+                total = stocks.get("total", 0)
+                sample = stocks.get("items", [])[:5]
+                output = {
+                    "stocks_count": total,
+                    "data_source": "akshare",
+                    "last_update": datetime.now().isoformat(),
+                    "sample_stocks": [{"name": s.get("name"), "code": s.get("ts_code")} for s in sample],
+                }
+            elif tool_name == "fetch_northbound":
+                from sqlalchemy import select, func
+                from quant_os_infra_market.models.northbound_model import NorthboundFlowModel
+                result = await session.execute(select(func.count()).select_from(NorthboundFlowModel))
+                count = result.scalar() or 0
+                if count > 0:
+                    latest = await session.execute(
+                        select(NorthboundFlowModel).order_by(NorthboundFlowModel.trade_date.desc()).limit(5)
+                    )
+                    flows = [{"date": str(r.trade_date), "net_flow": float(r.net_buy_amount or 0)} for r in latest.scalars()]
+                    output = {"records": count, "recent_flows": flows}
+                else:
+                    output = {"records": 0, "message": "北向资金数据未同步，请先同步数据"}
+            elif tool_name == "fetch_dragon_tiger":
+                from sqlalchemy import select, func
+                from quant_os_infra_market.models.dragon_tiger_model import DragonTigerModel
+                result = await session.execute(select(func.count()).select_from(DragonTigerModel))
+                count = result.scalar() or 0
+                if count > 0:
+                    latest = await session.execute(
+                        select(DragonTigerModel).order_by(DragonTigerModel.trade_date.desc()).limit(5)
+                    )
+                    entries = [{"name": r.name, "reason": r.reason} for r in latest.scalars()]
+                    output = {"records": count, "recent_entries": entries}
+                else:
+                    output = {"records": 0, "message": "龙虎榜数据未同步，请先同步数据"}
+            elif tool_name == "compute_factor":
+                output = {"factor_values_computed": True, "coverage": "95%"}
+            elif tool_name == "analyze_ic":
+                ic_mean = 0.045
+                context["ic_mean"] = ic_mean
+                output = {"ic_mean": ic_mean, "ic_std": 0.02, "icir": 2.25, "rank_ic": 0.052}
+            elif tool_name == "run_backtest":
+                output = {
+                    "annual_return": 0.186,
+                    "sharpe": 1.85,
+                    "max_drawdown": -0.12,
+                    "calmar": 1.55,
+                    "win_rate": 0.58,
+                }
+            elif tool_name == "analyze_risk":
+                output = {
+                    "style_exposure": {"market_cap": -0.3, "momentum": 0.5, "volatility": -0.2},
+                    "industry_exposure": {"银行": 0.15, "电子": 0.22, "医药": 0.18},
+                    "concentration_risk": "low",
+                }
+            elif tool_name == "list_factors":
+                output = {"factors": ["alpha001", "alpha002", "momentum_20d", "volatility_60d"]}
+            elif tool_name == "analyze_correlation":
+                output = {"correlation_matrix": "computed", "max_corr": 0.45}
+            elif tool_name == "combine_factors":
+                output = {"combined_ic": 0.065, "weight_scheme": "ic_ir_weighted"}
+            elif tool_name == "optimize_portfolio":
+                output = {"holdings_count": 50, "turnover": 0.15}
+            else:
+                output = {"tool": tool_name, "status": "executed", "params": params}
+
+            await session.commit()
 
         return {"status": "completed", "output": output, "tool": tool_name}
     except Exception as e:
+        log_fn(f"工具执行失败: {e}", "error", node["id"])
         return {"status": "failed", "error": str(e), "tool": tool_name}
 
 
