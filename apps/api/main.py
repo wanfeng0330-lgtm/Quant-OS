@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -51,10 +52,18 @@ def create_app() -> FastAPI:
 
     app.state.settings = settings
 
+    # Parse CORS origins - handle both list and JSON string
+    cors_origins = settings.app.cors_origins
+    if isinstance(cors_origins, str):
+        try:
+            cors_origins = json.loads(cors_origins)
+        except (json.JSONDecodeError, TypeError):
+            cors_origins = [cors_origins]
+
     # Middleware (order matters: last added = first executed)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.app.cors_origins,
+        allow_origins=cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
