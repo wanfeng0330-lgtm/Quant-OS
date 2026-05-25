@@ -89,14 +89,26 @@ async def init_database() -> None:
 
         # Simple migration: add missing columns to existing tables
         try:
+            from sqlalchemy import inspect as sa_inspect
             async with engine.begin() as conn:
-                await conn.execute(
-                    __import__("sqlalchemy").text(
-                        "ALTER TABLE dragon_tiger_list ADD COLUMN IF NOT EXISTS name VARCHAR(50)"
-                    )
-                )
+                # Check if 'name' column exists in dragon_tiger_list
+                def _check_columns(sync_conn):
+                    inspector = sa_inspect(sync_conn)
+                    cols = [c["name"] for c in inspector.get_columns("dragon_tiger_list")]
+                    return cols
+                try:
+                    cols = await conn.run_sync(_check_columns)
+                    if "name" not in cols:
+                        await conn.execute(
+                            __import__("sqlalchemy").text(
+                                "ALTER TABLE dragon_tiger_list ADD COLUMN name VARCHAR(50)"
+                            )
+                        )
+                        logger.info("Migration: added 'name' column to dragon_tiger_list")
+                except Exception:
+                    pass  # Table may not exist yet
         except Exception:
-            pass  # Column may already exist or SQLite doesn't support IF NOT EXISTS
+            pass
 
         _db_initialized = True
 

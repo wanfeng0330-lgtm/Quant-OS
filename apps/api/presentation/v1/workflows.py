@@ -503,7 +503,7 @@ async def _execute_tool_node(
                 from quant_os_infra_market.models.stock_model import StockModel
                 from quant_os_infra_market.models.ohlcv_model import OHLCVDailyModel
 
-                # Get stock counts
+                # Get stock counts from DB
                 total_result = await session.execute(select(sqlfunc.count()).select_from(StockModel))
                 total = total_result.scalar() or 0
 
@@ -516,29 +516,85 @@ async def _execute_tool_node(
                     total = sync_result.get("total", 0)
                     await session.commit()
 
-                # Get stock info
-                stocks = await ds.list_stocks(page=1, size=10)
-                sample = stocks.get("items", [])[:5]
+                # Fetch live market snapshot from AKShare (includes prices, change%, volume, industry)
+                live_snapshot = []
+                industry_counts = {}
+                try:
+                    import akshare as ak
+                    import pandas as _pd
 
-                # Get OHLCV data count
+                    log_fn("正在获取实时行情快照...", node_id=node["id"])
+                    df_spot = await provider._run_with_retry(ak.stock_zh_a_spot_em)
+
+                    if not df_spot.empty:
+                        # Build industry distribution
+                        if "板块" in df_spot.columns:
+                            ind_counts = df_spot["板块"].value_counts().head(15)
+                            industry_counts = {str(k): int(v) for k, v in ind_counts.items()}
+
+                        # Get top gainers and losers
+                        if "涨跌幅" in df_spot.columns:
+                            df_spot["涨跌幅"] = _pd.to_numeric(df_spot["涨跌幅"], errors="coerce")
+                            df_spot["最新价"] = _pd.to_numeric(df_spot["最新价"], errors="coerce")
+                            df_spot["成交额"] = _pd.to_numeric(df_spot["成交额"], errors="coerce")
+
+                            # Top 5 gainers
+                            top_gain = df_spot.nlargest(5, "涨跌幅")
+                            for _, row in top_gain.iterrows():
+                                live_snapshot.append({
+                                    "code": str(row.get("代码", "")),
+                                    "name": str(row.get("名称", "")),
+                                    "price": float(row["最新价"]) if _pd.notna(row["最新价"]) else None,
+                                    "change_pct": float(row["涨跌幅"]) if _pd.notna(row["涨跌幅"]) else None,
+                                    "amount": float(row["成交额"]) if _pd.notna(row["成交额"]) else None,
+                                    "type": "gainer",
+                                })
+
+                            # Top 5 losers
+                            top_lose = df_spot.nsmallest(5, "涨跌幅")
+                            for _, row in top_lose.iterrows():
+                                live_snapshot.append({
+                                    "code": str(row.get("代码", "")),
+                                    "name": str(row.get("名称", "")),
+                                    "price": float(row["最新价"]) if _pd.notna(row["最新价"]) else None,
+                                    "change_pct": float(row["涨跌幅"]) if _pd.notna(row["涨跌幅"]) else None,
+                                    "amount": float(row["成交额"]) if _pd.notna(row["成交额"]) else None,
+                                    "type": "loser",
+                                })
+
+                            # Market statistics
+                            up_count = int((df_spot["涨跌幅"] > 0).sum())
+                            down_count = int((df_spot["涨跌幅"] < 0).sum())
+                            flat_count = int((df_spot["涨跌幅"] == 0).sum())
+                            limit_up = int((df_spot["涨跌幅"] >= 9.9).sum())
+                            limit_down = int((df_spot["涨跌幅"] <= -9.9).sum())
+                            total_amount = float(df_spot["成交额"].sum()) if "成交额" in df_spot.columns else 0
+
+                            market_stats = {
+                                "up_count": up_count,
+                                "down_count": down_count,
+                                "flat_count": flat_count,
+                                "limit_up": limit_up,
+                                "limit_down": limit_down,
+                                "total_amount_billion": round(total_amount / 1e8, 2),
+                                "avg_change_pct": round(float(df_spot["涨跌幅"].mean()), 2),
+                            }
+                        else:
+                            market_stats = {}
+                    else:
+                        market_stats = {}
+
+                    log_fn(f"实时快照获取成功: {len(df_spot)} 只股票", node_id=node["id"])
+
+                except Exception as snap_err:
+                    log_fn(f"实时快照获取失败: {snap_err}", "warning", node["id"])
+                    market_stats = {}
+
+                # Also get OHLCV count from DB
                 ohlcv_result = await session.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))
                 ohlcv_count = ohlcv_result.scalar() or 0
 
-                # Try to sync OHLCV for a sample stock if no price data exists
-                if ohlcv_count == 0 and total > 0:
-                    log_fn("价格数据为空，正在同步样本数据...", node_id=node["id"])
-                    from quant_os_app_market.services.data_ingestion import DataIngestionService
-                    ingestion = DataIngestionService(session, provider)
-                    try:
-                        sample_code = sample[0]["ts_code"] if sample else "000001.SZ"
-                        await ingestion.sync_ohlcv_daily(ts_code=sample_code)
-                        await session.commit()
-                        ohlcv_result = await session.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))
-                        ohlcv_count = ohlcv_result.scalar() or 0
-                    except Exception as sync_err:
-                        log_fn(f"价格数据同步失败: {sync_err}", "warning", node["id"])
-
-                # Get latest price data for context
+                # Get latest OHLCV data from DB for additional context
                 latest_prices = []
                 if ohlcv_count > 0:
                     from sqlalchemy import desc
@@ -553,22 +609,33 @@ async def _execute_tool_node(
                             "volume": float(bar.volume),
                         })
 
-                # Get industry distribution
-                from sqlalchemy import desc as sql_desc
-                industry_result = await session.execute(
-                    select(StockModel.industry, sqlfunc.count().label("cnt"))
-                    .where(StockModel.industry.isnot(None))
-                    .group_by(StockModel.industry)
-                    .order_by(sqlfunc.count().desc())
-                    .limit(10)
-                )
-                industries = [{"name": r[0], "count": r[1]} for r in industry_result.all()]
+                # Get sample stocks
+                stocks = await ds.list_stocks(page=1, size=5)
+                sample = stocks.get("items", [])[:5]
+
+                # Build industry list from snapshot or DB
+                industries = []
+                if industry_counts:
+                    industries = [{"name": k, "count": v} for k, v in industry_counts.items()]
+                else:
+                    # Fallback: query DB
+                    from sqlalchemy import desc as sql_desc
+                    industry_result = await session.execute(
+                        select(StockModel.industry, sqlfunc.count().label("cnt"))
+                        .where(StockModel.industry.isnot(None))
+                        .group_by(StockModel.industry)
+                        .order_by(sqlfunc.count().desc())
+                        .limit(10)
+                    )
+                    industries = [{"name": r[0], "count": r[1]} for r in industry_result.all()]
 
                 output = {
                     "stocks_count": total,
                     "ohlcv_records": ohlcv_count,
                     "data_source": "akshare",
                     "last_update": datetime.now().isoformat(),
+                    "market_stats": market_stats,
+                    "top_movers": live_snapshot,
                     "sample_stocks": [{"name": s.get("name"), "code": s.get("ts_code")} for s in sample],
                     "latest_prices": latest_prices,
                     "top_industries": industries,
