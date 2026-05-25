@@ -60,11 +60,14 @@ def create_app() -> FastAPI:
         except (json.JSONDecodeError, TypeError):
             cors_origins = [cors_origins]
 
+    # Wildcard origins cannot be used with allow_credentials=True
+    use_credentials = "*" not in cors_origins
+
     # Middleware (order matters: last added = first executed)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
-        allow_credentials=True,
+        allow_credentials=use_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
     )
