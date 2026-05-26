@@ -114,13 +114,23 @@ async def _do_full_sync(db: AsyncSession) -> dict:
             factory = get_session_factory()
             return factory, DataIngestionService.__new__(DataIngestionService)
 
-        # Step 1: Stock list
+        # Step 1: Stock list - prefer Tushare (has industry data)
         logger.info("Sync step 1/5: stock list")
         try:
             from dependencies import get_session_factory
             factory = get_session_factory()
+
+            tushare_provider = None
+            try:
+                tushare_provider = ProviderFactory.get("tushare")
+            except (ValueError, RuntimeError):
+                pass
+
             async with factory() as step_session:
-                step_ingestion = DataIngestionService(step_session, provider)
+                if tushare_provider:
+                    step_ingestion = DataIngestionService(step_session, tushare_provider)
+                else:
+                    step_ingestion = DataIngestionService(step_session, provider)
                 res = await step_ingestion.sync_stock_list()
                 await step_session.commit()
                 results["stocks"] = res

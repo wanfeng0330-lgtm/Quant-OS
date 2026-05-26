@@ -91,10 +91,10 @@ RESEARCH_WORKFLOW_TEMPLATES: dict[str, dict[str, Any]] = {
                 {"id": "data_sync", "name": "全量数据同步", "type": "task", "config": {"type": "tool", "tool": "sync_all_market_data"}, "dependencies": []},
                 # Layer 1: 并行分析（依赖数据同步完成）
                 {"id": "factor_discovery", "name": "因子探索与发现", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的market_overview、top_gainers、top_losers、top_volume等真实数据，发现并评估有潜力的Alpha因子。给出2-3个具体因子公式（如动量因子、量价因子），解释其经济逻辑和适用场景。"}, "dependencies": ["data_sync"]},
-                {"id": "sector_analysis", "name": "行业轮动分析", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的top_industries（行业分布）、top_gainers/top_losers（涨跌幅排行）、northbound_daily（北向资金流向）数据，分析行业轮动趋势。指出当前强势行业、弱势行业，以及资金流入方向。"}, "dependencies": ["data_sync"]},
-                {"id": "sentiment_calc", "name": "市场情绪研判", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的market_overview（涨跌家数、涨跌停数、成交额）、northbound_daily（北向资金净流入）、dragon_tiger_entries（龙虎榜）数据，综合分析市场情绪。给出情绪评分(0-100)、情绪偏多/偏空判断、以及情绪变化趋势。"}, "dependencies": ["data_sync"]},
+                {"id": "sector_analysis", "name": "行业轮动分析", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的industry_stats（行业涨跌统计）、top_gainers/top_losers（涨跌幅排行）、dragon_tiger_entries（龙虎榜）数据，分析行业轮动趋势。指出当前强势行业和弱势行业，分析资金集中方向。"}, "dependencies": ["data_sync"]},
+                {"id": "sentiment_calc", "name": "市场情绪研判", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的market_overview（涨跌家数、涨跌停数、成交额）、dragon_tiger_entries（龙虎榜）、industry_stats（行业涨跌）数据，综合分析市场情绪。给出情绪评分(0-100)、情绪偏多/偏空判断、以及情绪变化趋势。"}, "dependencies": ["data_sync"]},
                 # Layer 2: 综合报告（依赖所有分析完成）
-                {"id": "report_synthesis", "name": "综合研究报告", "type": "task", "config": {"type": "llm", "prompt": "基于以上三个分析结果（因子探索、行业轮动、市场情绪），生成一份完整的A股市场综合研究报告。报告格式要求：\n\n## 今日A股市场综合研究报告\n\n### 一、市场概况\n引用具体的涨跌家数、涨跌停数、总成交额（亿元）、平均涨跌幅等数据\n\n### 二、行业轮动分析\n指出强势行业和弱势行业，引用北向资金流向数据\n\n### 三、因子发现\n推荐2-3个有潜力的量化因子及其逻辑\n\n### 四、市场情绪研判\n给出情绪评分(0-100)和偏多/偏空判断，引用涨跌比、北向资金、龙虎榜数据\n\n### 五、综合结论\n用通俗易懂的语言总结今日市场状况\n\n### 六、投资建议\n给出具体可操作的建议\n\n注意：用通俗易懂的语言，必须引用真实数据，不要编造。"}, "dependencies": ["factor_discovery", "sector_analysis", "sentiment_calc"]},
+                {"id": "report_synthesis", "name": "综合研究报告", "type": "task", "config": {"type": "llm", "prompt": "基于以上三个分析结果（因子探索、行业轮动、市场情绪），生成一份完整的A股市场综合研究报告。报告格式要求：\n\n## 今日A股市场综合研究报告\n\n### 一、市场概况\n引用具体的涨跌家数、涨跌停数、总成交额（亿元）、平均涨跌幅等数据\n\n### 二、行业轮动分析\n指出强势行业和弱势行业，引用行业统计数据\n\n### 三、因子发现\n推荐2-3个有潜力的量化因子及其逻辑\n\n### 四、市场情绪研判\n给出情绪评分(0-100)和偏多/偏空判断，引用涨跌比、龙虎榜数据\n\n### 五、综合结论\n用通俗易懂的语言总结今日市场状况\n\n### 六、投资建议\n给出具体可操作的建议\n\n注意：用通俗易懂的语言，必须引用真实数据，不要编造。"}, "dependencies": ["factor_discovery", "sector_analysis", "sentiment_calc"]},
             ],
         },
     },
@@ -595,40 +595,33 @@ async def _execute_tool_node(
                     result_data["market_overview"] = {"error": "无行情数据，请先执行数据同步"}
                     log_fn("OHLCV: 无数据", "warning", node_id=node["id"])
 
-                # --- Northbound Flow ---
-                nb_count = (await session.execute(
-                    select(sqlfunc.count()).select_from(NorthboundFlowModel)
-                    .where(NorthboundFlowModel.net_amount.isnot(None))
-                )).scalar() or 0
-                if nb_count > 0:
-                    # Aggregate by date (last 20 days with actual data)
-                    nb_daily = await session.execute(
+                # --- Industry Stats (join OHLCV with Stock for industry) ---
+                if latest_date:
+                    industry_stats = await session.execute(
                         select(
-                            NorthboundFlowModel.trade_date,
-                            sqlfunc.sum(NorthboundFlowModel.net_amount).label("total_net"),
+                            StockModel.industry,
+                            sqlfunc.count().label("stock_count"),
+                            sqlfunc.avg(OHLCVDailyModel.pct_chg).label("avg_pct_chg"),
+                            sqlfunc.sum(OHLCVDailyModel.amount).label("total_amount"),
                         )
-                        .where(NorthboundFlowModel.net_amount.isnot(None))
-                        .group_by(NorthboundFlowModel.trade_date)
-                        .order_by(sql_desc(NorthboundFlowModel.trade_date))
-                        .limit(20)
+                        .join(OHLCVDailyModel, StockModel.ts_code == OHLCVDailyModel.ts_code)
+                        .where(OHLCVDailyModel.trade_date == latest_date)
+                        .where(StockModel.industry.isnot(None))
+                        .group_by(StockModel.industry)
+                        .order_by(sql_desc(sqlfunc.avg(OHLCVDailyModel.pct_chg)))
+                        .limit(30)
                     )
-                    nb_rows = nb_daily.all()
-                    result_data["northbound_daily"] = [
-                        {"date": str(r[0]), "net_flow_billion": round(float(r[1] or 0) / 1e8, 2)}
-                        for r in nb_rows
+                    ind_rows = industry_stats.all()
+                    result_data["industry_stats"] = [
+                        {
+                            "name": r[0],
+                            "stock_count": int(r[1]),
+                            "avg_pct_chg": round(float(r[2] or 0), 2),
+                            "total_amount_billion": round(float(r[3] or 0) / 1e8, 2),
+                        }
+                        for r in ind_rows
                     ]
-                    # Total net flow
-                    total_net = sum(r[1] or 0 for r in nb_rows)
-                    result_data["northbound_summary"] = {
-                        "total_records": nb_count,
-                        "recent_net_flow_billion": round(float(total_net) / 1e8, 2),
-                        "latest_date": str(nb_rows[0][0]) if nb_rows else None,
-                    }
-                    log_fn(f"北向资金: {nb_count} 条记录, 最近净流入 {round(float(total_net)/1e8, 2)} 亿", node_id=node["id"])
-                else:
-                    result_data["northbound_daily"] = []
-                    result_data["northbound_summary"] = {"total_records": 0}
-                    log_fn("北向资金: 无数据", "warning", node_id=node["id"])
+                    log_fn(f"行业统计: {len(ind_rows)} 个行业", node_id=node["id"])
 
                 # --- Dragon Tiger ---
                 dt_count = (await session.execute(select(sqlfunc.count()).select_from(DragonTigerModel))).scalar() or 0
@@ -654,17 +647,6 @@ async def _execute_tool_node(
                 else:
                     result_data["dragon_tiger_entries"] = []
                     log_fn("龙虎榜: 无数据", "warning", node_id=node["id"])
-
-                # --- Industry distribution ---
-                industry_result = await session.execute(
-                    select(StockModel.industry, sqlfunc.count().label("cnt"))
-                    .where(StockModel.industry.isnot(None))
-                    .group_by(StockModel.industry)
-                    .order_by(sqlfunc.count().desc())
-                    .limit(15)
-                )
-                industries = [{"name": r[0], "count": r[1]} for r in industry_result.all()]
-                result_data["top_industries"] = industries
 
                 result_data["data_source"] = "database"
                 result_data["last_update"] = datetime.now().isoformat()
