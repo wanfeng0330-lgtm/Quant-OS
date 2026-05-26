@@ -278,7 +278,7 @@ async def _run_agent(
         Message(role=MessageRole.USER, content=message),
     ]
 
-    max_iterations = 3
+    max_iterations = 5
     total_tokens = 0
     import logging
     logger = logging.getLogger(__name__)
