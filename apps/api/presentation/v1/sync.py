@@ -114,23 +114,13 @@ async def _do_full_sync(db: AsyncSession) -> dict:
             factory = get_session_factory()
             return factory, DataIngestionService.__new__(DataIngestionService)
 
-        # Step 1: Stock list - prefer Tushare (has industry data)
+        # Step 1: Stock list
         logger.info("Sync step 1/5: stock list")
         try:
             from dependencies import get_session_factory
             factory = get_session_factory()
-
-            tushare_provider = None
-            try:
-                tushare_provider = ProviderFactory.get("tushare")
-            except (ValueError, RuntimeError):
-                pass
-
             async with factory() as step_session:
-                if tushare_provider:
-                    step_ingestion = DataIngestionService(step_session, tushare_provider)
-                else:
-                    step_ingestion = DataIngestionService(step_session, provider)
+                step_ingestion = DataIngestionService(step_session, provider)
                 res = await step_ingestion.sync_stock_list()
                 await step_session.commit()
                 results["stocks"] = res
@@ -138,6 +128,42 @@ async def _do_full_sync(db: AsyncSession) -> dict:
         except Exception as e:
             logger.error("Stock list sync failed: %s", e)
             results["stocks"] = {"error": str(e)}
+
+        # Step 1b: Enrich industry data from Tushare (non-blocking)
+        logger.info("Sync step 1b: enrich industry data")
+        try:
+            tushare_provider = None
+            try:
+                tushare_provider = ProviderFactory.get("tushare")
+            except (ValueError, RuntimeError):
+                pass
+
+            if tushare_provider:
+                import asyncio as _aio
+                loop = _aio.get_event_loop()
+                import tushare as ts
+                api = tushare_provider._get_api()
+                df = await loop.run_in_executor(None, lambda: api.stock_basic(exchange="", list_status="L", fields="ts_code,industry"))
+                if not df.empty:
+                    from quant_os_infra_market.models.stock_model import StockModel
+                    async with factory() as step_session:
+                        industry_map = dict(zip(df["ts_code"], df["industry"]))
+                        # Update stocks with industry data
+                        stocks = (await step_session.execute(
+                            select(StockModel).where(StockModel.industry.is_(None))
+                        )).scalars().all()
+                        updated = 0
+                        for s in stocks:
+                            ind = industry_map.get(s.ts_code)
+                            if ind:
+                                s.industry = ind
+                                updated += 1
+                        await step_session.commit()
+                        results["industry_enrichment"] = {"updated": updated}
+                        logger.info("Industry enrichment: %d stocks updated", updated)
+        except Exception as e:
+            logger.warning("Industry enrichment failed (non-fatal): %s", e)
+            results["industry_enrichment"] = {"error": str(e)[:200]}
 
         await asyncio.sleep(10)
 
