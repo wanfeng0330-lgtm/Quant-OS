@@ -184,33 +184,29 @@ async def chat_research(
 
 
 async def _detect_intent(message: str) -> str:
-    """Hybrid intent detection: fast keywords first, LLM for ambiguous cases."""
-    # --- Fast path: obvious research keywords ---
-    research_keywords = [
-        "分析", "研究", "报告", "行情", "市场情绪", "因子", "回测",
-        "行业轮动", "量化", "alpha", "策略", "选股", "大盘",
-        "涨跌", "涨停", "跌停", "板块", "资金流", "情绪研判",
-        "龙虎榜", "主力", "北向", "综合研究",
-    ]
-    if any(kw in message for kw in research_keywords):
-        return "research"
-
-    # --- Fast path: obvious chat keywords (only if no research signal) ---
-    chat_keywords = ["你好", "谢谢", "你是谁", "你是", "再见"]
-    if any(kw == message for kw in chat_keywords):
-        return "chat"
-
-    # --- Ambiguous: ask LLM ---
+    """LLM-based intent detection with clear guidance."""
     settings = get_app_settings()
     provider = LLMProviderFactory.create(settings.llm.default_provider)
     classify_messages = [
         Message(
             role=MessageRole.SYSTEM,
             content=(
-                "判断用户意图。用户想要：\n"
-                "A) 获取或分析A股市场数据（行情、涨跌、板块、资金、情绪等）→ 回复 research\n"
-                "B) 闲聊、问概念、问操作方法 → 回复 chat\n"
-                "只回复一个词。"
+                "你是意图分类器。判断用户是想「获取市场数据做研究」还是「普通对话」。\n\n"
+                "research：用户明确要求获取、查看、分析实时A股市场数据。例如：\n"
+                "- 今日市场/大盘/行情怎么样\n"
+                "- 分析一下今天的市场\n"
+                "- 涨停板/跌停板有哪些\n"
+                "- 板块轮动/行业分析\n"
+                "- 市场情绪研判\n"
+                "- 帮我研究一下XX\n"
+                "- 生成研究报告\n\n"
+                "chat：用户在聊天、问概念、问操作方法、闲聊。例如：\n"
+                "- 你好/谢谢\n"
+                "- 什么是量化/因子/IC\n"
+                "- 怎么使用这个系统\n"
+                "- 帮我解释一下XX概念\n"
+                "- 你觉得XX怎么样（观点类问题）\n\n"
+                "只回复一个词：research 或 chat"
             ),
         ),
         Message(role=MessageRole.USER, content=message),
@@ -272,7 +268,7 @@ async def chat_message(
             )).one()
             market_brief = f"当前数据库: {ohlcv_count}条行情({latest_date}), 涨{stats[1]}/跌{stats[2]}, 成交额{round(float(stats[3] or 0)/1e8)}亿"
 
-    system_prompt = f"""你是 QuantOS AI 量化研究助手。你是一个纯对话模型，没有工具调用能力。
+    system_prompt = f"""你是 QuantOS AI 量化研究助手。你是没有工具调用能力，只能基于数据库信息进行回答。
 
 你的职责：
 1. 回答关于A股市场、量化投资、金融知识的问题
@@ -285,7 +281,7 @@ async def chat_message(
 - 你不能调用任何工具、API或外部数据源。不要生成tool_call、function_call或任何代码块。
 - 直接用文字回答用户问题，基于你已有的知识和上方提供的数据。
 - 如果用户需要实时市场分析、板块行情、涨跌停分析等需要完整数据的研究，请直接告诉用户："这个需求需要运行完整研究分析，请输入'分析今日市场'等指令来触发。"
-- 回答要简洁专业。"""
+- 回答要简洁专业，但同时要易懂。"""
 
     llm_messages = [
         Message(role=MessageRole.SYSTEM, content=system_prompt),

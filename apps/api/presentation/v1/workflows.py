@@ -432,11 +432,16 @@ async def _execute_llm_node(
 
     system_prompt = config.get("prompt", "你是一个量化研究助手。")
     # Build context summary with real data (allow sufficient context for analysis)
-    context_summary = json.dumps({k: v for k, v in context.items() if k not in ("input",)}, ensure_ascii=False, indent=2)
+    context_summary = json.dumps({k: v for k, v in context.items() if k not in ("input", "user_message")}, ensure_ascii=False, indent=2)
     # Truncate only if extremely large (80K chars max)
     if len(context_summary) > 80000:
         context_summary = context_summary[:80000] + "\n...(数据截断)"
-    user_msg = f"以下是真实的市场数据上下文（来自数据库）:\n{context_summary}\n\n请执行: {system_prompt}\n\n要求：基于以上真实数据分析，给出有数据支撑的结论，不要编造数据。如果某些数据缺失，请如实说明，不要杜撰。"
+
+    # Include user's specific question so LLM focuses on what they asked
+    user_question = context.get("user_message", "")
+    question_line = f"\n\n【用户具体问题】{user_question}\n请重点围绕用户的问题进行分析，不要泛泛而谈。" if user_question else ""
+
+    user_msg = f"以下是真实的市场数据上下文（来自数据库）:\n{context_summary}\n\n请执行: {system_prompt}{question_line}\n\n要求：基于以上真实数据分析，给出有数据支撑的结论，不要编造数据。如果某些数据缺失，请如实说明，不要杜撰。"
 
     messages = [
         Message(role=MessageRole.SYSTEM, content="你是一个专业的A股量化研究AI分析师。请基于提供的真实市场数据进行分析，用数据说话，给出清晰的结论和可操作的建议。不要编造数据，只使用上下文中提供的数据。"),
