@@ -211,7 +211,12 @@ async def _run_agent(
         ),
         ToolDefinition(
             name="query_limit_up",
-            description="查询今日涨停板个股列表，含涨停原因、连板数、所属行业",
+            description="查询今日涨停板个股列表，含连板数、所属行业",
+            parameters={"type": "object", "properties": {"limit": {"type": "integer", "description": "返回条数，默认30"}}, "required": []},
+        ),
+        ToolDefinition(
+            name="query_limit_down",
+            description="查询今日跌停板个股列表",
             parameters={"type": "object", "properties": {"limit": {"type": "integer", "description": "返回条数，默认20"}}, "required": []},
         ),
         ToolDefinition(
@@ -221,6 +226,14 @@ async def _run_agent(
                 "sector": {"type": "string", "description": "行业名称，如'通信'、'电子'、'银行'、'医药'等"},
                 "limit": {"type": "integer", "description": "返回条数，默认20"},
             }, "required": ["sector"]},
+        ),
+        ToolDefinition(
+            name="query_sector_ranking",
+            description="查询所有行业板块的涨跌幅排行，返回每个行业的平均涨跌幅、涨跌家数、成交额。用于回答'哪个板块涨得最猛'、'板块排行'等问题",
+            parameters={"type": "object", "properties": {
+                "limit": {"type": "integer", "description": "返回条数，默认30"},
+                "sort_by": {"type": "string", "enum": ["gainers", "losers"], "description": "排序方式，默认gainers"},
+            }, "required": []},
         ),
         ToolDefinition(
             name="query_top_stocks",
@@ -237,33 +250,40 @@ async def _run_agent(
         ),
         ToolDefinition(
             name="query_stock",
-            description="查询单只股票的最新行情数据",
+            description="查询单只股票的最新行情数据，含行业、价格、涨跌幅、成交量",
             parameters={"type": "object", "properties": {
                 "ts_code": {"type": "string", "description": "股票代码，如'000001.SZ'、'600519.SH'"},
             }, "required": ["ts_code"]},
         ),
         ToolDefinition(
-            name="query_sector_ranking",
-            description="查询所有行业板块的涨跌幅排行，返回每个行业的平均涨跌幅、涨跌家数、成交额。用于回答'哪个板块涨得最猛'、'板块排行'等问题",
-            parameters={"type": "object", "properties": {
-                "limit": {"type": "integer", "description": "返回条数，默认30"},
-                "sort_by": {"type": "string", "enum": ["gainers", "losers"], "description": "排序方式，默认gainers"},
-            }, "required": []},
-        ),
-        ToolDefinition(
             name="query_stock_history",
-            description="查询单只股票最近N天的历史行情数据",
+            description="查询单只股票最近N天的历史行情数据，含每日OHLCV和涨跌幅",
             parameters={"type": "object", "properties": {
                 "ts_code": {"type": "string", "description": "股票代码，如'000001.SZ'"},
-                "days": {"type": "integer", "description": "天数，默认10"},
+                "days": {"type": "integer", "description": "天数，默认20"},
             }, "required": ["ts_code"]},
         ),
         ToolDefinition(
             name="search_stocks",
-            description="按股票名称模糊搜索，返回匹配的股票列表",
+            description="按股票名称模糊搜索，返回匹配的股票列表（名称、代码、行业）",
             parameters={"type": "object", "properties": {
                 "keyword": {"type": "string", "description": "搜索关键词，如'茅台'、'宁德'"},
             }, "required": ["keyword"]},
+        ),
+        ToolDefinition(
+            name="query_market_distribution",
+            description="查询市场涨跌幅分布统计：多少股票涨超5%、跌超5%、涨停、跌停等分布情况。用于分析市场整体强弱",
+            parameters={"type": "object", "properties": {}, "required": []},
+        ),
+        ToolDefinition(
+            name="query_consecutive_limit_up",
+            description="查询连板股列表（连续涨停2天以上的股票），用于分析市场情绪和龙头股",
+            parameters={"type": "object", "properties": {"min_days": {"type": "integer", "description": "最少连板天数，默认2"}}, "required": []},
+        ),
+        ToolDefinition(
+            name="query_volume_leaders",
+            description="查询换手率排行，高换手率代表资金活跃度高",
+            parameters={"type": "object", "properties": {"limit": {"type": "integer", "description": "返回条数，默认20"}}, "required": []},
         ),
     ]
 
@@ -454,6 +474,87 @@ async def _run_agent(
                     "name": s.name, "ts_code": s.ts_code, "industry": s.industry,
                 } for s in rows], ensure_ascii=False)
 
+            elif name == "query_limit_down":
+                limit = args.get("limit", 20)
+                latest_date = (await db.execute(
+                    select(OHLCVDailyModel.trade_date).group_by(OHLCVDailyModel.trade_date)
+                    .order_by(sqlfunc.count().desc()).limit(1)
+                )).scalar_one_or_none()
+                if not latest_date:
+                    return _json.dumps({"error": "无行情数据"}, ensure_ascii=False)
+                rows = (await db.execute(
+                    select(StockModel.name, StockModel.ts_code, StockModel.industry, OHLCVDailyModel.close, OHLCVDailyModel.pct_chg, OHLCVDailyModel.amount)
+                    .join(OHLCVDailyModel, StockModel.ts_code == OHLCVDailyModel.ts_code)
+                    .where(OHLCVDailyModel.trade_date == latest_date)
+                    .where(OHLCVDailyModel.pct_chg <= -9.9)
+                    .order_by(OHLCVDailyModel.pct_chg)
+                    .limit(limit)
+                )).all()
+                return _json.dumps([{"name": r[0], "ts_code": r[1], "industry": r[2], "close": float(r[3]), "pct_chg": float(r[4]), "amount_billion": round(float(r[5] or 0) / 1e8, 2)} for r in rows], ensure_ascii=False)
+
+            elif name == "query_market_distribution":
+                latest_date = (await db.execute(
+                    select(OHLCVDailyModel.trade_date).group_by(OHLCVDailyModel.trade_date)
+                    .order_by(sqlfunc.count().desc()).limit(1)
+                )).scalar_one_or_none()
+                if not latest_date:
+                    return _json.dumps({"error": "无行情数据"}, ensure_ascii=False)
+                dist = (await db.execute(select(
+                    sqlfunc.count(),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg >= 9.9, 1), else_=0)),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg >= 5, 1), else_=0)),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg >= 0, 1), else_=0)),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg <= -5, 1), else_=0)),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg <= -9.9, 1), else_=0)),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg.between(-1, 1), 1), else_=0)),
+                ).where(OHLCVDailyModel.trade_date == latest_date))).one()
+                return _json.dumps({
+                    "date": str(latest_date), "total": int(dist[0]),
+                    "limit_up": int(dist[1] or 0), "up_5pct": int(dist[2] or 0),
+                    "up": int(dist[3] or 0), "down_5pct": int(dist[4] or 0),
+                    "limit_down": int(dist[5] or 0), "flat_range": int(dist[6] or 0),
+                }, ensure_ascii=False)
+
+            elif name == "query_consecutive_limit_up":
+                min_days = args.get("min_days", 2)
+                import akshare as ak
+                loop = asyncio.get_event_loop()
+                zt_df = await loop.run_in_executor(None, lambda: ak.stock_zt_pool_em(date=datetime.now().strftime("%Y%m%d")))
+                if zt_df.empty:
+                    return _json.dumps({"error": "今日无涨停数据"}, ensure_ascii=False)
+                cols = list(zt_df.columns)
+                records = []
+                for _, row in zt_df.iterrows():
+                    consecutive = int(row.iloc[14]) if len(cols) > 14 else 1
+                    if consecutive >= min_days:
+                        records.append({
+                            "name": str(row.iloc[2]) if len(cols) > 2 else "",
+                            "code": str(row.iloc[1]) if len(cols) > 1 else "",
+                            "pct_chg": round(float(row.iloc[3]), 2) if len(cols) > 3 else 0,
+                            "consecutive": consecutive,
+                            "industry": str(row.iloc[15]) if len(cols) > 15 else "",
+                        })
+                records.sort(key=lambda x: x["consecutive"], reverse=True)
+                return _json.dumps(records, ensure_ascii=False)
+
+            elif name == "query_volume_leaders":
+                limit = args.get("limit", 20)
+                latest_date = (await db.execute(
+                    select(OHLCVDailyModel.trade_date).group_by(OHLCVDailyModel.trade_date)
+                    .order_by(sqlfunc.count().desc()).limit(1)
+                )).scalar_one_or_none()
+                if not latest_date:
+                    return _json.dumps({"error": "无行情数据"}, ensure_ascii=False)
+                rows = (await db.execute(
+                    select(StockModel.name, StockModel.ts_code, StockModel.industry, OHLCVDailyModel.close, OHLCVDailyModel.pct_chg, OHLCVDailyModel.volume, OHLCVDailyModel.amount)
+                    .join(OHLCVDailyModel, StockModel.ts_code == OHLCVDailyModel.ts_code)
+                    .where(OHLCVDailyModel.trade_date == latest_date)
+                    .where(OHLCVDailyModel.volume > 0)
+                    .order_by(sql_desc(OHLCVDailyModel.volume))
+                    .limit(limit)
+                )).all()
+                return _json.dumps([{"name": r[0], "ts_code": r[1], "industry": r[2], "close": float(r[3]), "pct_chg": float(r[4]), "volume": float(r[5]), "amount_billion": round(float(r[6] or 0) / 1e8, 2)} for r in rows], ensure_ascii=False)
+
             else:
                 return _json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False)
         except Exception as e:
@@ -486,24 +587,31 @@ async def _run_agent(
         "你是 QuantOS AI 量化研究助手。你拥有以下工具可以查询A股市场实时数据，必须通过调用工具获取数据来回答用户问题：\n\n"
         "可用工具：\n"
         "- query_market_overview: 市场整体概况（涨跌家数、涨跌停数、成交额）\n"
+        "- query_market_distribution: 涨跌幅分布统计（涨超5%、跌超5%、涨停、跌停数量）\n"
         "- query_indices: 主要指数行情（上证、深证、沪深300、创业板、科创50）\n"
         "- query_limit_up: 涨停板个股列表\n"
+        "- query_limit_down: 跌停板个股列表\n"
+        "- query_consecutive_limit_up(min_days=2): 连板股列表（连续涨停）\n"
         "- query_sector(sector='行业名'): 指定行业的个股行情\n"
         "- query_sector_ranking(sort_by='gainers'): 所有行业板块涨跌幅排行\n"
         "- query_top_stocks(sort_by='gainers'): 涨幅/跌幅/成交额排行\n"
+        "- query_volume_leaders: 换手率/成交量排行\n"
         "- query_dragon_tiger: 龙虎榜数据\n"
         "- query_stock(ts_code='代码'): 单只股票行情\n"
-        "- query_stock_history(ts_code='代码'): 股票历史行情\n"
+        "- query_stock_history(ts_code='代码', days=20): 股票历史行情\n"
         "- search_stocks(keyword='关键词'): 按名称搜索股票\n\n"
         f"{market_brief}\n\n"
-        "规则：\n"
-        "- 你必须调用工具获取数据，不要凭空编造数据\n"
-        "- 用户问'哪个板块涨得最猛/板块排行'→ 调用 query_sector_ranking\n"
-        "- 用户问某个具体板块 → 调用 query_sector(sector='板块名')\n"
-        "- 用户问大盘/市场 → 调用 query_market_overview + query_indices\n"
-        "- 用户问涨停 → 调用 query_limit_up\n"
-        "- 用户问某只股票 → 调用 query_stock 或 search_stocks\n"
-        "- 回答要基于工具返回的真实数据，用数据说话，简洁专业"
+        "调用规则：\n"
+        "- 你必须调用工具获取数据，不要凭空编造\n"
+        "- '哪个板块涨得最猛/板块排行' → query_sector_ranking\n"
+        "- 某个具体板块 → query_sector(sector='板块名')\n"
+        "- 大盘/市场概况 → query_market_overview + query_indices\n"
+        "- 涨停/跌停 → query_limit_up / query_limit_down\n"
+        "- 连板/龙头 → query_consecutive_limit_up\n"
+        "- 某只股票 → search_stocks先查代码，再query_stock\n"
+        "- 市场强弱/赚钱效应 → query_market_distribution\n"
+        "- 可以组合调用多个工具获取全面数据\n"
+        "- 回答基于真实数据，用数据说话，简洁专业"
     )
 
     llm_messages = [
