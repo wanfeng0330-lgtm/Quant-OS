@@ -596,14 +596,18 @@ async def _execute_tool_node(
                     log_fn("OHLCV: 无数据", "warning", node_id=node["id"])
 
                 # --- Northbound Flow ---
-                nb_count = (await session.execute(select(sqlfunc.count()).select_from(NorthboundFlowModel))).scalar() or 0
+                nb_count = (await session.execute(
+                    select(sqlfunc.count()).select_from(NorthboundFlowModel)
+                    .where(NorthboundFlowModel.net_amount.isnot(None))
+                )).scalar() or 0
                 if nb_count > 0:
-                    # Aggregate by date (last 20 days)
+                    # Aggregate by date (last 20 days with actual data)
                     nb_daily = await session.execute(
                         select(
                             NorthboundFlowModel.trade_date,
                             sqlfunc.sum(NorthboundFlowModel.net_amount).label("total_net"),
                         )
+                        .where(NorthboundFlowModel.net_amount.isnot(None))
                         .group_by(NorthboundFlowModel.trade_date)
                         .order_by(sql_desc(NorthboundFlowModel.trade_date))
                         .limit(20)
