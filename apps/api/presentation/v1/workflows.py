@@ -514,10 +514,13 @@ async def _execute_tool_node(
                 # --- OHLCV Market Statistics ---
                 ohlcv_count = (await session.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))).scalar() or 0
                 if ohlcv_count > 0:
-                    # Get the latest trade date
+                    # Get the date with the most records (not just the latest)
                     latest_date = (await session.execute(
-                        select(sqlfunc.max(OHLCVDailyModel.trade_date))
-                    )).scalar()
+                        select(OHLCVDailyModel.trade_date)
+                        .group_by(OHLCVDailyModel.trade_date)
+                        .order_by(sqlfunc.count().desc())
+                        .limit(1)
+                    )).scalar_one_or_none()
 
                     if latest_date:
                         # Market-wide stats for latest date

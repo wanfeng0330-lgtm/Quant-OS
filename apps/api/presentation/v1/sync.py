@@ -131,11 +131,20 @@ async def _do_full_sync(db: AsyncSession) -> dict:
 
         await asyncio.sleep(10)
 
-        # Step 2: Northbound flow (own session)
+        # Step 2: Northbound flow - prefer Tushare (has complete data)
         logger.info("Sync step 2/5: northbound flow")
         try:
+            tushare_provider = None
+            try:
+                tushare_provider = ProviderFactory.get("tushare")
+            except (ValueError, RuntimeError):
+                pass
+
             async with factory() as step_session:
-                step_ingestion = DataIngestionService(step_session, provider)
+                if tushare_provider:
+                    step_ingestion = DataIngestionService(step_session, tushare_provider)
+                else:
+                    step_ingestion = DataIngestionService(step_session, provider)
                 res = await step_ingestion.sync_northbound_flow()
                 await step_session.commit()
                 results["northbound"] = res

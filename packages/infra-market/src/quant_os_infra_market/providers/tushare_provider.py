@@ -252,29 +252,34 @@ class TushareProvider:
         api = self._get_api()
         try:
             kwargs: dict[str, Any] = {}
-            if ts_code:
-                kwargs["ts_code"] = ts_code
             if start_date:
                 kwargs["start_date"] = start_date.strftime("%Y%m%d")
             if end_date:
                 kwargs["end_date"] = end_date.strftime("%Y%m%d")
+            if not start_date and not end_date:
+                # Default to last 30 days
+                from datetime import timedelta
+                kwargs["start_date"] = (date.today() - timedelta(days=30)).strftime("%Y%m%d")
+                kwargs["end_date"] = date.today().strftime("%Y%m%d")
 
-            df = await self._run_with_retry(api.hsgt_top10, **kwargs)
+            # Use moneyflow_hsgt for aggregate northbound flow (not individual stocks)
+            df = await self._run_with_retry(api.moneyflow_hsgt, **kwargs)
 
             if df.empty:
                 return pd.DataFrame()
 
             result = pd.DataFrame()
-            result["ts_code"] = df.get("ts_code", None)
+            result["ts_code"] = None
             result["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
-            result["channel"] = df.get("hsgt", "all")
-            result["buy_amount"] = pd.to_numeric(df.get("buy", pd.Series(dtype=float)), errors="coerce")
-            result["sell_amount"] = pd.to_numeric(df.get("sell", pd.Series(dtype=float)), errors="coerce")
-            result["net_amount"] = pd.to_numeric(df.get("net_buy", pd.Series(dtype=float)), errors="coerce")
+            result["channel"] = "all"
+            # north_money is in 万元, convert to 元 (multiply by 10000)
+            result["net_amount"] = pd.to_numeric(df.get("north_money", pd.Series(dtype=float)), errors="coerce") * 10000
+            result["buy_amount"] = None
+            result["sell_amount"] = None
             result["hold_volume"] = None
             result["hold_ratio"] = None
 
-            logger.info("Fetched %d northbound flow records from Tushare", len(result))
+            logger.info("Fetched %d northbound flow records from Tushare (moneyflow_hsgt)", len(result))
             return result
 
         except Exception as exc:
