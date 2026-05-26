@@ -195,9 +195,8 @@ async def _run_agent(
     from sqlalchemy import func as sqlfunc, desc as sql_desc, case
 
     settings = get_app_settings()
-    provider = LLMProviderFactory.create(settings.llm.default_provider)
-
-    # --- Tool definitions ---
+    provider = LLMProviderFactory.create("deepseek")
+    agent_model = settings.llm.deepseek_model
     tools = [
         ToolDefinition(
             name="query_market_overview",
@@ -627,7 +626,7 @@ async def _run_agent(
             response = await provider.chat(
                 llm_messages,
                 tools=tools,
-                config=LLMConfig(model=settings.llm.mimo_model, temperature=0.3, max_tokens=3000),
+                config=LLMConfig(model=agent_model, temperature=0.3, max_tokens=3000),
             )
         except Exception as e:
             return {"type": "error", "message": f"LLM 调用失败: {str(e)}"}
@@ -698,10 +697,10 @@ async def chat_message(
         # Fallback: direct LLM answer without tools
         try:
             settings = get_app_settings()
-            provider = LLMProviderFactory.create(settings.llm.default_provider)
+            provider = LLMProviderFactory.create("deepseek")
             response = await provider.chat(
                 [Message(role=MessageRole.SYSTEM, content="你是QuantOS AI量化研究助手。"), Message(role=MessageRole.USER, content=message)],
-                config=LLMConfig(model=settings.llm.mimo_model, temperature=0.5, max_tokens=2000),
+                config=LLMConfig(model=settings.llm.deepseek_model, temperature=0.5, max_tokens=2000),
             )
             return ok({"type": "direct_answer", "content": response.content or "无法处理请求", "model": response.model})
         except Exception:
