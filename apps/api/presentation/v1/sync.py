@@ -159,110 +159,74 @@ async def _do_full_sync(db: AsyncSession) -> dict:
             logger.error("Dragon tiger sync failed: %s", e)
             results["dragon_tiger"] = {"error": str(e)}
 
-        # Step 4: OHLCV - use market snapshot (all stocks at once) instead of per-stock
-        logger.info("Sync step 4/5: OHLCV market snapshot (waiting 30s cooldown)")
-        await asyncio.sleep(30)
+        # Step 4: OHLCV - prefer Tushare (stable), fallback to AKShare snapshot
+        logger.info("Sync step 4/5: OHLCV daily sync")
+        await asyncio.sleep(5)
         try:
-            import pandas as _pd
-
-            # Use direct HTTP to EastMoney API (bypasses AKShare session issues)
             async with factory() as step_session:
-                from quant_os_infra_market.models.ohlcv_model import OHLCVDailyModel
                 from quant_os_infra_market.repositories.ohlcv_repo import OHLCVRepository
 
-                logger.info("Fetching market snapshot for OHLCV via direct HTTP...")
+                today = datetime.now().date()
+                repo = OHLCVRepository(step_session)
 
-                loop = asyncio.get_event_loop()
-                def _fetch_snapshot():
-                    import requests
-                    url = "https://82.push2.eastmoney.com/api/qt/clist/get"
-                    params = {
-                        "pn": 1, "pz": 6000, "po": 1, "np": 1,
-                        "fltt": 2, "invt": 2, "fid": "f3",
-                        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
-                        "fields": "f2,f3,f4,f5,f6,f7,f8,f12,f14,f15,f16,f17,f18",
-                    }
-                    headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        "Referer": "https://quote.eastmoney.com/",
-                    }
-                    sess = requests.Session()
-                    resp = sess.get(url, params=params, headers=headers, timeout=30)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    items = data.get("data", {}).get("diff", [])
-                    if not items:
-                        return _pd.DataFrame()
-                    rows = []
-                    for item in items:
-                        code = str(item.get("f12", ""))
-                        if not code:
-                            continue
-                        rows.append({
-                            "代码": code,
-                            "最新价": item.get("f2"),
-                            "涨跌幅": item.get("f3"),
-                            "涨跌额": item.get("f4"),
-                            "成交量": item.get("f5"),
-                            "成交额": item.get("f6"),
-                            "振幅": item.get("f7"),
-                            "换手率": item.get("f8"),
-                            "名称": item.get("f14"),
-                            "最高": item.get("f15"),
-                            "最低": item.get("f16"),
-                            "今开": item.get("f17"),
-                            "昨收": item.get("f18"),
-                        })
-                    return _pd.DataFrame(rows)
+                # Try Tushare first (stable API, one call gets all stocks)
+                tushare_provider = None
+                try:
+                    tushare_provider = ProviderFactory.get("tushare")
+                except (ValueError, RuntimeError):
+                    pass
 
-                # Retry with exponential backoff
-                df = None
-                for attempt in range(5):
-                    try:
-                        df = await loop.run_in_executor(None, _fetch_snapshot)
-                        break
-                    except Exception as fetch_err:
-                        wait = 10 * (attempt + 1)
-                        logger.warning("Snapshot fetch failed (attempt %d/5), retrying in %ds: %s",
-                                       attempt + 1, wait, fetch_err)
-                        await asyncio.sleep(wait)
+                if tushare_provider:
+                    logger.info("Using Tushare for OHLCV sync (trade_date=%s)...", today)
+                    df = await tushare_provider.fetch_ohlcv_daily(trade_date=today)
 
-                if df is not None and not df.empty:
-                    today = datetime.now().date()
-                    repo = OHLCVRepository(step_session)
-
-                    # Convert snapshot to OHLCV records
-                    records = []
-                    for _, row in df.iterrows():
-                        ts_code = provider._to_ts_code(str(row.get("代码", "")))
-                        close = _pd.to_numeric(row.get("最新价"), errors="coerce")
-                        if _pd.isna(close) or close <= 0:
-                            continue
-                        records.append({
-                            "ts_code": ts_code,
-                            "trade_date": today,
-                            "open": float(_pd.to_numeric(row.get("今开"), errors="coerce") or close),
-                            "high": float(_pd.to_numeric(row.get("最高"), errors="coerce") or close),
-                            "low": float(_pd.to_numeric(row.get("最低"), errors="coerce") or close),
-                            "close": float(close),
-                            "volume": float(_pd.to_numeric(row.get("成交量"), errors="coerce") or 0),
-                            "amount": float(_pd.to_numeric(row.get("成交额"), errors="coerce") or 0),
-                            "pct_chg": float(_pd.to_numeric(row.get("涨跌幅"), errors="coerce") or 0),
-                            "pre_close": float(_pd.to_numeric(row.get("昨收"), errors="coerce") or close),
-                        })
-
-                    if records:
+                    if not df.empty:
+                        records = df.to_dict("records")
                         inserted = await repo.bulk_insert(records)
                         await step_session.commit()
-                        logger.info("OHLCV snapshot: %d records inserted for %s", inserted, today)
-                        results["ohlcv"] = {"inserted": inserted, "date": str(today), "source": "market_snapshot"}
+                        logger.info("OHLCV via Tushare: %d records inserted for %s", inserted, today)
+                        results["ohlcv"] = {"inserted": inserted, "date": str(today), "source": "tushare"}
                     else:
-                        results["ohlcv"] = {"inserted": 0, "message": "No valid records in snapshot"}
+                        results["ohlcv"] = {"inserted": 0, "message": "Tushare returned no data for today"}
                 else:
-                    msg = "All snapshot fetch attempts failed" if df is None else "Market snapshot empty"
-                    results["ohlcv"] = {"inserted": 0, "message": msg}
+                    # Fallback: use AKShare market snapshot
+                    logger.info("Tushare not available, falling back to AKShare snapshot...")
+                    import akshare as ak
+                    import pandas as _pd
+
+                    df = await provider._run_with_retry(ak.stock_zh_a_spot_em, max_retries=5)
+
+                    if not df.empty:
+                        records = []
+                        for _, row in df.iterrows():
+                            ts_code = provider._to_ts_code(str(row.get("代码", "")))
+                            close = _pd.to_numeric(row.get("最新价"), errors="coerce")
+                            if _pd.isna(close) or close <= 0:
+                                continue
+                            records.append({
+                                "ts_code": ts_code,
+                                "trade_date": today,
+                                "open": float(_pd.to_numeric(row.get("今开"), errors="coerce") or close),
+                                "high": float(_pd.to_numeric(row.get("最高"), errors="coerce") or close),
+                                "low": float(_pd.to_numeric(row.get("最低"), errors="coerce") or close),
+                                "close": float(close),
+                                "volume": float(_pd.to_numeric(row.get("成交量"), errors="coerce") or 0),
+                                "amount": float(_pd.to_numeric(row.get("成交额"), errors="coerce") or 0),
+                                "pct_chg": float(_pd.to_numeric(row.get("涨跌幅"), errors="coerce") or 0),
+                                "pre_close": float(_pd.to_numeric(row.get("昨收"), errors="coerce") or close),
+                            })
+
+                        if records:
+                            inserted = await repo.bulk_insert(records)
+                            await step_session.commit()
+                            logger.info("OHLCV via AKShare snapshot: %d records inserted", inserted)
+                            results["ohlcv"] = {"inserted": inserted, "date": str(today), "source": "akshare_snapshot"}
+                        else:
+                            results["ohlcv"] = {"inserted": 0, "message": "No valid records"}
+                    else:
+                        results["ohlcv"] = {"inserted": 0, "message": "AKShare snapshot empty"}
         except Exception as e:
-            logger.error("OHLCV snapshot sync failed: %s", e)
+            logger.error("OHLCV sync failed: %s", e)
             results["ohlcv"] = {"error": str(e)[:300]}
 
         duration = (datetime.now() - started).total_seconds()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import date, datetime
 from functools import partial
 from typing import Any
@@ -21,6 +22,7 @@ class TushareProvider:
     def __init__(self, token: str) -> None:
         self._token = token
         self._api = None
+        self._last_call_time: float = 0.0
 
     @property
     def provider_name(self) -> str:
@@ -37,10 +39,35 @@ class TushareProvider:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, partial(func, *args, **kwargs))
 
+    async def _run_with_retry(self, func, *args, max_retries: int = 3, **kwargs) -> Any:
+        """Run with rate limiting and retry on connection errors."""
+        for attempt in range(max_retries):
+            # Rate limiting: 300ms between calls (Tushare free tier: 200/min)
+            now = time.monotonic()
+            elapsed = now - self._last_call_time
+            if elapsed < 0.3:
+                await asyncio.sleep(0.3 - elapsed)
+            self._last_call_time = time.monotonic()
+
+            try:
+                return await self._run_sync(func, *args, **kwargs)
+            except Exception as e:
+                error_str = str(e).lower()
+                is_retryable = any(kw in error_str for kw in (
+                    "connection", "timeout", "retry", "limit", "频次",
+                ))
+                if is_retryable and attempt < max_retries - 1:
+                    wait = 5 * (attempt + 1)
+                    logger.warning("Tushare call failed (attempt %d/%d), retrying in %ds: %s",
+                                   attempt + 1, max_retries, wait, e)
+                    await asyncio.sleep(wait)
+                    continue
+                raise
+
     async def fetch_stock_list(self) -> pd.DataFrame:
         api = self._get_api()
         try:
-            df = await self._run_sync(api.stock_basic, exchange="", list_status="L",
+            df = await self._run_with_retry(api.stock_basic, exchange="", list_status="L",
                                        fields="ts_code,symbol,name,area,industry,list_date,delist_date,is_hs")
 
             result = pd.DataFrame()
@@ -84,7 +111,7 @@ class TushareProvider:
             if end_date:
                 kwargs["end_date"] = end_date.strftime("%Y%m%d")
 
-            df = await self._run_sync(api.daily, **kwargs)
+            df = await self._run_with_retry(api.daily, **kwargs)
 
             if df.empty:
                 return pd.DataFrame()
@@ -127,7 +154,7 @@ class TushareProvider:
             if end_date:
                 kwargs["end_date"] = end_date.strftime("%Y%m%d")
 
-            df = await self._run_sync(api.adj_factor, **kwargs)
+            df = await self._run_with_retry(api.adj_factor, **kwargs)
 
             if df.empty:
                 return pd.DataFrame()
@@ -155,7 +182,7 @@ class TushareProvider:
             if fiscal_year:
                 kwargs["period"] = f"{fiscal_year}1231" if report_type == "Annual" else f"{fiscal_year}0331"
 
-            df = await self._run_sync(api.income, **kwargs)
+            df = await self._run_with_retry(api.income, **kwargs)
 
             if df.empty:
                 return pd.DataFrame()
@@ -194,7 +221,7 @@ class TushareProvider:
                 if end_date:
                     kwargs["end_date"] = end_date.strftime("%Y%m%d")
 
-            df = await self._run_sync(api.top_list, **kwargs)
+            df = await self._run_with_retry(api.top_list, **kwargs)
 
             if df.empty:
                 return pd.DataFrame()
@@ -232,7 +259,7 @@ class TushareProvider:
             if end_date:
                 kwargs["end_date"] = end_date.strftime("%Y%m%d")
 
-            df = await self._run_sync(api.hsgt_top10, **kwargs)
+            df = await self._run_with_retry(api.hsgt_top10, **kwargs)
 
             if df.empty:
                 return pd.DataFrame()
@@ -275,7 +302,7 @@ class TushareProvider:
                 yr = year or datetime.now().year
                 kwargs["end_date"] = f"{yr}1231"
 
-            df = await self._run_sync(api.trade_cal, **kwargs)
+            df = await self._run_with_retry(api.trade_cal, **kwargs)
 
             if df.empty:
                 return pd.DataFrame()
@@ -327,7 +354,7 @@ class TushareProvider:
             if end_date:
                 kwargs["end_date"] = end_date.strftime("%Y%m%d")
 
-            df = await self._run_sync(api.daily_basic, **kwargs)
+            df = await self._run_with_retry(api.daily_basic, **kwargs)
 
             if df.empty:
                 return pd.DataFrame()
