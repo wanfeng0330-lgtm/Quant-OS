@@ -33,10 +33,13 @@ from .factor_tools import (
     AnalyzeFactorTool,
 )
 from .backtest_tools import (
-    RunBacktestTool,
     GetBacktestResultTool,
     ListBacktestsTool,
+    RunBacktestTool,
 )
+
+# Import market query tools to trigger registration
+from . import market_query_tools  # noqa: F401
 
 __all__ = [
     # Base types

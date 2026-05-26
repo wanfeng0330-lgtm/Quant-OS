@@ -91,6 +91,26 @@ class ToolRegistry:
         """
         return [tool.to_definition() for tool in self._tools.values()]
 
+    def get_tool_definitions(self) -> list:
+        """Get all tool definitions as ToolDefinition objects for LLM providers.
+
+        Returns:
+            List of ToolDefinition objects
+        """
+        from quant_os_infra_agent.llm.base import ToolDefinition
+        return [
+            ToolDefinition(
+                name=tool.name,
+                description=tool.description,
+                parameters={
+                    "type": "object",
+                    "properties": {p.name: p.to_dict() for p in tool.parameters},
+                    "required": [p.name for p in tool.parameters if p.required],
+                },
+            )
+            for tool in self._tools.values()
+        ]
+
     async def execute(self, name: str, **kwargs: Any) -> ToolResult:
         """Execute a tool by name.
 

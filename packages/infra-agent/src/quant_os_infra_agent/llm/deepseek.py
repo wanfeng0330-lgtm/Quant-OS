@@ -159,7 +159,7 @@ class DeepSeekProvider(BaseLLMProvider):
 
         if tools:
             payload["tools"] = [t.to_dict() for t in tools]
-            payload["tool_choice"] = "auto"
+            payload["tool_choice"] = config.tool_choice or "auto"
 
         return payload
 
