@@ -90,11 +90,11 @@ RESEARCH_WORKFLOW_TEMPLATES: dict[str, dict[str, Any]] = {
                 # Layer 0: 单一数据同步节点（顺序执行所有AKShare调用，避免并行冲突）
                 {"id": "data_sync", "name": "全量数据同步", "type": "task", "config": {"type": "tool", "tool": "sync_all_market_data"}, "dependencies": []},
                 # Layer 1: 并行分析（依赖数据同步完成）
-                {"id": "factor_discovery", "name": "因子探索与发现", "type": "task", "config": {"type": "llm", "prompt": "基于市场数据上下文，发现并评估有潜力的Alpha因子，给出因子公式和逻辑解释"}, "dependencies": ["data_sync"]},
-                {"id": "sector_analysis", "name": "行业轮动分析", "type": "task", "config": {"type": "llm", "prompt": "分析行业轮动和板块动量，找出当前强势行业和潜在机会"}, "dependencies": ["data_sync"]},
-                {"id": "sentiment_calc", "name": "市场情绪研判", "type": "task", "config": {"type": "llm", "prompt": "综合分析市场情绪，包括涨跌停、北向资金、龙虎榜等多维度数据，给出情绪评分和趋势判断"}, "dependencies": ["data_sync"]},
+                {"id": "factor_discovery", "name": "因子探索与发现", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的market_overview、top_gainers、top_losers、top_volume等真实数据，发现并评估有潜力的Alpha因子。给出2-3个具体因子公式（如动量因子、量价因子），解释其经济逻辑和适用场景。"}, "dependencies": ["data_sync"]},
+                {"id": "sector_analysis", "name": "行业轮动分析", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的top_industries（行业分布）、top_gainers/top_losers（涨跌幅排行）、northbound_daily（北向资金流向）数据，分析行业轮动趋势。指出当前强势行业、弱势行业，以及资金流入方向。"}, "dependencies": ["data_sync"]},
+                {"id": "sentiment_calc", "name": "市场情绪研判", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的market_overview（涨跌家数、涨跌停数、成交额）、northbound_daily（北向资金净流入）、dragon_tiger_entries（龙虎榜）数据，综合分析市场情绪。给出情绪评分(0-100)、情绪偏多/偏空判断、以及情绪变化趋势。"}, "dependencies": ["data_sync"]},
                 # Layer 2: 综合报告（依赖所有分析完成）
-                {"id": "report_synthesis", "name": "综合研究报告", "type": "task", "config": {"type": "llm", "prompt": "基于以上所有分析结果，生成一份完整的A股市场综合研究报告。报告格式要求：\n\n## 今日A股市场综合研究报告\n\n### 一、市场概况\n简述当前市场整体情况，包括涨跌家数、涨停跌停数、总成交额等核心数据\n\n### 二、行业轮动分析\n分析哪些行业表现强势，哪些行业在走弱\n\n### 三、因子发现\n推荐有潜力的量化因子及其逻辑\n\n### 四、市场情绪研判\n当前市场情绪是偏多还是偏空，依据是什么\n\n### 五、综合结论\n用通俗易懂的语言总结今日市场状况\n\n### 六、投资建议\n给出具体可操作的建议（如关注哪些板块、注意什么风险）\n\n注意：用通俗易懂的语言，避免过多专业术语，让普通投资者也能看懂。基于真实数据分析，不要编造数据。"}, "dependencies": ["factor_discovery", "sector_analysis", "sentiment_calc"]},
+                {"id": "report_synthesis", "name": "综合研究报告", "type": "task", "config": {"type": "llm", "prompt": "基于以上三个分析结果（因子探索、行业轮动、市场情绪），生成一份完整的A股市场综合研究报告。报告格式要求：\n\n## 今日A股市场综合研究报告\n\n### 一、市场概况\n引用具体的涨跌家数、涨跌停数、总成交额（亿元）、平均涨跌幅等数据\n\n### 二、行业轮动分析\n指出强势行业和弱势行业，引用北向资金流向数据\n\n### 三、因子发现\n推荐2-3个有潜力的量化因子及其逻辑\n\n### 四、市场情绪研判\n给出情绪评分(0-100)和偏多/偏空判断，引用涨跌比、北向资金、龙虎榜数据\n\n### 五、综合结论\n用通俗易懂的语言总结今日市场状况\n\n### 六、投资建议\n给出具体可操作的建议\n\n注意：用通俗易懂的语言，必须引用真实数据，不要编造。"}, "dependencies": ["factor_discovery", "sector_analysis", "sentiment_calc"]},
             ],
         },
     },
@@ -431,9 +431,12 @@ async def _execute_llm_node(
     provider = LLMProviderFactory.create(provider_name)
 
     system_prompt = config.get("prompt", "你是一个量化研究助手。")
-    # Build context summary with real data (allow more context for comprehensive reports)
-    context_summary = json.dumps({k: str(v)[:2000] for k, v in context.items()}, ensure_ascii=False, indent=2)
-    user_msg = f"以下是真实的市场数据上下文:\n{context_summary}\n\n请执行: {system_prompt}\n\n要求：基于以上真实数据分析，给出有数据支撑的结论，不要编造数据。如果某些数据缺失，请如实说明，不要杜撰。"
+    # Build context summary with real data (allow sufficient context for analysis)
+    context_summary = json.dumps({k: v for k, v in context.items() if k not in ("input",)}, ensure_ascii=False, indent=2)
+    # Truncate only if extremely large (80K chars max)
+    if len(context_summary) > 80000:
+        context_summary = context_summary[:80000] + "\n...(数据截断)"
+    user_msg = f"以下是真实的市场数据上下文（来自数据库）:\n{context_summary}\n\n请执行: {system_prompt}\n\n要求：基于以上真实数据分析，给出有数据支撑的结论，不要编造数据。如果某些数据缺失，请如实说明，不要杜撰。"
 
     messages = [
         Message(role=MessageRole.SYSTEM, content="你是一个专业的A股量化研究AI分析师。请基于提供的真实市场数据进行分析，用数据说话，给出清晰的结论和可操作的建议。不要编造数据，只使用上下文中提供的数据。"),
@@ -495,7 +498,7 @@ async def _execute_tool_node(
 
             if tool_name == "sync_all_market_data":
                 # Read all data from database (pre-synced by scheduled sync job)
-                from sqlalchemy import select, func as sqlfunc, desc as sql_desc
+                from sqlalchemy import select, func as sqlfunc, desc as sql_desc, case, and_
                 from quant_os_infra_market.models.stock_model import StockModel
                 from quant_os_infra_market.models.northbound_model import NorthboundFlowModel
                 from quant_os_infra_market.models.dragon_tiger_model import DragonTigerModel
@@ -508,55 +511,144 @@ async def _execute_tool_node(
                 result_data["stocks_count"] = total
                 log_fn(f"数据库: {total} 只股票", node_id=node["id"])
 
-                # Northbound flow
+                # --- OHLCV Market Statistics ---
+                ohlcv_count = (await session.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))).scalar() or 0
+                if ohlcv_count > 0:
+                    # Get the latest trade date
+                    latest_date = (await session.execute(
+                        select(sqlfunc.max(OHLCVDailyModel.trade_date))
+                    )).scalar()
+
+                    if latest_date:
+                        # Market-wide stats for latest date
+                        stats_row = (await session.execute(
+                            select(
+                                sqlfunc.count().label("total"),
+                                sqlfunc.sum(case((OHLCVDailyModel.pct_chg > 0, 1), else_=0)).label("up_count"),
+                                sqlfunc.sum(case((OHLCVDailyModel.pct_chg < 0, 1), else_=0)).label("down_count"),
+                                sqlfunc.sum(case((OHLCVDailyModel.pct_chg == 0, 1), else_=0)).label("flat_count"),
+                                sqlfunc.sum(case((OHLCVDailyModel.pct_chg >= 9.9, 1), else_=0)).label("limit_up"),
+                                sqlfunc.sum(case((OHLCVDailyModel.pct_chg <= -9.9, 1), else_=0)).label("limit_down"),
+                                sqlfunc.sum(OHLCVDailyModel.volume).label("total_volume"),
+                                sqlfunc.sum(OHLCVDailyModel.amount).label("total_amount"),
+                                sqlfunc.avg(OHLCVDailyModel.pct_chg).label("avg_pct_chg"),
+                                sqlfunc.max(OHLCVDailyModel.pct_chg).label("max_pct_chg"),
+                                sqlfunc.min(OHLCVDailyModel.pct_chg).label("min_pct_chg"),
+                            ).where(OHLCVDailyModel.trade_date == latest_date)
+                        )).one()
+
+                        result_data["market_overview"] = {
+                            "trade_date": str(latest_date),
+                            "total_stocks": int(stats_row.total or 0),
+                            "up_count": int(stats_row.up_count or 0),
+                            "down_count": int(stats_row.down_count or 0),
+                            "flat_count": int(stats_row.flat_count or 0),
+                            "limit_up_count": int(stats_row.limit_up or 0),
+                            "limit_down_count": int(stats_row.limit_down or 0),
+                            "total_volume_billion": round(float(stats_row.total_volume or 0) / 1e8, 2),
+                            "total_amount_billion": round(float(stats_row.total_amount or 0) / 1e8, 2),
+                            "avg_pct_chg": round(float(stats_row.avg_pct_chg or 0), 2),
+                            "max_pct_chg": round(float(stats_row.max_pct_chg or 0), 2),
+                            "min_pct_chg": round(float(stats_row.min_pct_chg or 0), 2),
+                        }
+                        log_fn(f"市场概况: {stats_row.total}只股票, 涨{stats_row.up_count}/跌{stats_row.down_count}, 涨停{stats_row.limit_up}/跌停{stats_row.limit_down}", node_id=node["id"])
+
+                        # Top gainers (top 15)
+                        top_gainers = await session.execute(
+                            select(OHLCVDailyModel.ts_code, OHLCVDailyModel.close, OHLCVDailyModel.pct_chg, OHLCVDailyModel.volume, OHLCVDailyModel.amount)
+                            .where(OHLCVDailyModel.trade_date == latest_date)
+                            .order_by(sql_desc(OHLCVDailyModel.pct_chg))
+                            .limit(15)
+                        )
+                        result_data["top_gainers"] = [
+                            {"ts_code": r[0], "close": float(r[1]), "pct_chg": float(r[2]), "volume": float(r[3]), "amount": float(r[4] or 0)}
+                            for r in top_gainers.all()
+                        ]
+
+                        # Top losers (top 15)
+                        top_losers = await session.execute(
+                            select(OHLCVDailyModel.ts_code, OHLCVDailyModel.close, OHLCVDailyModel.pct_chg, OHLCVDailyModel.volume, OHLCVDailyModel.amount)
+                            .where(OHLCVDailyModel.trade_date == latest_date)
+                            .order_by(OHLCVDailyModel.pct_chg)
+                            .limit(15)
+                        )
+                        result_data["top_losers"] = [
+                            {"ts_code": r[0], "close": float(r[1]), "pct_chg": float(r[2]), "volume": float(r[3]), "amount": float(r[4] or 0)}
+                            for r in top_losers.all()
+                        ]
+
+                        # Top volume (top 15)
+                        top_vol = await session.execute(
+                            select(OHLCVDailyModel.ts_code, OHLCVDailyModel.close, OHLCVDailyModel.pct_chg, OHLCVDailyModel.volume, OHLCVDailyModel.amount)
+                            .where(OHLCVDailyModel.trade_date == latest_date)
+                            .order_by(sql_desc(OHLCVDailyModel.volume))
+                            .limit(15)
+                        )
+                        result_data["top_volume"] = [
+                            {"ts_code": r[0], "close": float(r[1]), "pct_chg": float(r[2]), "volume": float(r[3]), "amount": float(r[4] or 0)}
+                            for r in top_vol.all()
+                        ]
+                else:
+                    result_data["market_overview"] = {"error": "无行情数据，请先执行数据同步"}
+                    log_fn("OHLCV: 无数据", "warning", node_id=node["id"])
+
+                # --- Northbound Flow ---
                 nb_count = (await session.execute(select(sqlfunc.count()).select_from(NorthboundFlowModel))).scalar() or 0
                 if nb_count > 0:
-                    latest_nb = await session.execute(
-                        select(NorthboundFlowModel).order_by(NorthboundFlowModel.trade_date.desc()).limit(10)
+                    # Aggregate by date (last 20 days)
+                    nb_daily = await session.execute(
+                        select(
+                            NorthboundFlowModel.trade_date,
+                            sqlfunc.sum(NorthboundFlowModel.net_amount).label("total_net"),
+                        )
+                        .group_by(NorthboundFlowModel.trade_date)
+                        .order_by(sql_desc(NorthboundFlowModel.trade_date))
+                        .limit(20)
                     )
-                    result_data["northbound_flows"] = [
-                        {"date": str(r.trade_date), "net_flow_billion": round(float(r.net_amount or 0) / 1e8, 2)}
-                        for r in latest_nb.scalars()
+                    nb_rows = nb_daily.all()
+                    result_data["northbound_daily"] = [
+                        {"date": str(r[0]), "net_flow_billion": round(float(r[1] or 0) / 1e8, 2)}
+                        for r in nb_rows
                     ]
-                    log_fn(f"北向资金: {nb_count} 条记录", node_id=node["id"])
+                    # Total net flow
+                    total_net = sum(r[1] or 0 for r in nb_rows)
+                    result_data["northbound_summary"] = {
+                        "total_records": nb_count,
+                        "recent_net_flow_billion": round(float(total_net) / 1e8, 2),
+                        "latest_date": str(nb_rows[0][0]) if nb_rows else None,
+                    }
+                    log_fn(f"北向资金: {nb_count} 条记录, 最近净流入 {round(float(total_net)/1e8, 2)} 亿", node_id=node["id"])
                 else:
-                    result_data["northbound_flows"] = []
-                    log_fn("北向资金: 无数据，请先执行数据同步", "warning", node["id"])
+                    result_data["northbound_daily"] = []
+                    result_data["northbound_summary"] = {"total_records": 0}
+                    log_fn("北向资金: 无数据", "warning", node_id=node["id"])
 
-                # Dragon tiger
+                # --- Dragon Tiger ---
                 dt_count = (await session.execute(select(sqlfunc.count()).select_from(DragonTigerModel))).scalar() or 0
                 if dt_count > 0:
                     latest_dt = await session.execute(
-                        select(DragonTigerModel).order_by(DragonTigerModel.trade_date.desc()).limit(10)
+                        select(DragonTigerModel)
+                        .order_by(DragonTigerModel.trade_date.desc())
+                        .limit(20)
                     )
                     result_data["dragon_tiger_entries"] = [
-                        {"name": getattr(r, "name", None) or r.ts_code, "reason": r.reason, "date": str(r.trade_date)}
+                        {
+                            "name": getattr(r, "name", None) or r.ts_code,
+                            "ts_code": r.ts_code,
+                            "reason": r.reason,
+                            "buy_amount": float(r.buy_amount or 0),
+                            "sell_amount": float(r.sell_amount or 0),
+                            "net_amount": float(r.net_amount or 0),
+                            "date": str(r.trade_date),
+                        }
                         for r in latest_dt.scalars()
                     ]
                     log_fn(f"龙虎榜: {dt_count} 条记录", node_id=node["id"])
                 else:
                     result_data["dragon_tiger_entries"] = []
-                    log_fn("龙虎榜: 无数据，请先执行数据同步", "warning", node["id"])
+                    log_fn("龙虎榜: 无数据", "warning", node_id=node["id"])
 
-                # OHLCV data
-                ohlcv_count = (await session.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))).scalar() or 0
-                latest_prices = []
-                if ohlcv_count > 0:
-                    latest_bars = await session.execute(
-                        select(OHLCVDailyModel).order_by(sql_desc(OHLCVDailyModel.trade_date)).limit(10)
-                    )
-                    for bar in latest_bars.scalars():
-                        latest_prices.append({
-                            "ts_code": bar.ts_code,
-                            "date": str(bar.trade_date),
-                            "close": float(bar.close),
-                            "volume": float(bar.volume),
-                            "pct_chg": float(bar.pct_chg) if bar.pct_chg else None,
-                        })
-                    log_fn(f"OHLCV: {ohlcv_count} 条记录", node_id=node["id"])
-                result_data["latest_prices"] = latest_prices
-
-                # Industry distribution from stock list
+                # --- Industry distribution ---
                 industry_result = await session.execute(
                     select(StockModel.industry, sqlfunc.count().label("cnt"))
                     .where(StockModel.industry.isnot(None))
@@ -567,7 +659,6 @@ async def _execute_tool_node(
                 industries = [{"name": r[0], "count": r[1]} for r in industry_result.all()]
                 result_data["top_industries"] = industries
 
-                result_data["market_stats"] = {"note": "实时行情数据需通过数据同步获取"}
                 result_data["data_source"] = "database"
                 result_data["last_update"] = datetime.now().isoformat()
 
