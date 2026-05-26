@@ -184,28 +184,33 @@ async def chat_research(
 
 
 async def _detect_intent(message: str) -> str:
-    """Use LLM to classify user intent as 'research' or 'chat'."""
+    """Hybrid intent detection: fast keywords first, LLM for ambiguous cases."""
+    # --- Fast path: obvious research keywords ---
+    research_keywords = [
+        "分析", "研究", "报告", "行情", "市场情绪", "因子", "回测",
+        "行业轮动", "量化", "alpha", "策略", "选股", "大盘",
+        "涨跌", "涨停", "跌停", "板块", "资金流", "情绪研判",
+        "龙虎榜", "主力", "北向", "综合研究",
+    ]
+    if any(kw in message for kw in research_keywords):
+        return "research"
+
+    # --- Fast path: obvious chat keywords (only if no research signal) ---
+    chat_keywords = ["你好", "谢谢", "你是谁", "你是", "再见"]
+    if any(kw == message for kw in chat_keywords):
+        return "chat"
+
+    # --- Ambiguous: ask LLM ---
     settings = get_app_settings()
     provider = LLMProviderFactory.create(settings.llm.default_provider)
     classify_messages = [
         Message(
             role=MessageRole.SYSTEM,
             content=(
-                "你是一个意图分类器。判断用户消息是需要「研究分析」还是「日常对话」。\n\n"
-                "研究分析（research）：用户想要获取、分析、研究A股市场的实时数据。包括但不限于：\n"
-                "- 市场行情/大盘/板块分析\n"
-                "- 涨跌停、涨停板、跌停板\n"
-                "- 行业轮动、板块行情\n"
-                "- 市场情绪、资金流向\n"
-                "- 因子分析、量化策略、回测\n"
-                "- 生成研究报告、综合分析\n"
-                "- 任何需要实时市场数据支撑的分析请求\n\n"
-                "日常对话（chat）：不需要实时数据的对话。包括：\n"
-                "- 闲聊问候（你好、谢谢）\n"
-                "- 概念解释（什么是量化、什么是IC）\n"
-                "- 通用知识问答\n"
-                "- 操作指导\n\n"
-                "只回复一个词：research 或 chat"
+                "判断用户意图。用户想要：\n"
+                "A) 获取或分析A股市场数据（行情、涨跌、板块、资金、情绪等）→ 回复 research\n"
+                "B) 闲聊、问概念、问操作方法 → 回复 chat\n"
+                "只回复一个词。"
             ),
         ),
         Message(role=MessageRole.USER, content=message),
