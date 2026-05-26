@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -92,9 +92,9 @@ RESEARCH_WORKFLOW_TEMPLATES: dict[str, dict[str, Any]] = {
                 # Layer 1: 并行分析（依赖数据同步完成）
                 {"id": "factor_discovery", "name": "因子探索与发现", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的market_overview、top_gainers、top_losers、top_volume等真实数据，发现并评估有潜力的Alpha因子。给出2-3个具体因子公式（如动量因子、量价因子），解释其经济逻辑和适用场景。"}, "dependencies": ["data_sync"]},
                 {"id": "sector_analysis", "name": "行业轮动分析", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的industry_stats（行业涨跌统计）、top_gainers/top_losers（涨跌幅排行）、dragon_tiger_entries（龙虎榜）数据，分析行业轮动趋势。指出当前强势行业和弱势行业，分析资金集中方向。"}, "dependencies": ["data_sync"]},
-                {"id": "sentiment_calc", "name": "市场情绪研判", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的market_overview（涨跌家数、涨跌停数、成交额）、dragon_tiger_entries（龙虎榜）、industry_stats（行业涨跌）数据，综合分析市场情绪。给出情绪评分(0-100)、情绪偏多/偏空判断、以及情绪变化趋势。"}, "dependencies": ["data_sync"]},
+                {"id": "sentiment_calc", "name": "市场情绪研判", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的market_overview（涨跌家数、涨跌停数、成交额）、market_indices（主要指数涨跌幅）、limit_up_pool（涨停股及原因）、dragon_tiger_entries（龙虎榜）数据，综合分析市场情绪。给出情绪评分(0-100)、情绪偏多/偏空判断、以及情绪变化趋势。"}, "dependencies": ["data_sync"]},
                 # Layer 2: 综合报告（依赖所有分析完成）
-                {"id": "report_synthesis", "name": "综合研究报告", "type": "task", "config": {"type": "llm", "prompt": "基于以上三个分析结果（因子探索、行业轮动、市场情绪），生成一份完整的A股市场综合研究报告。报告格式要求：\n\n## 今日A股市场综合研究报告\n\n### 一、市场概况\n引用具体的涨跌家数、涨跌停数、总成交额（亿元）、平均涨跌幅等数据\n\n### 二、行业轮动分析\n指出强势行业和弱势行业，引用行业统计数据\n\n### 三、因子发现\n推荐2-3个有潜力的量化因子及其逻辑\n\n### 四、市场情绪研判\n给出情绪评分(0-100)和偏多/偏空判断，引用涨跌比、龙虎榜数据\n\n### 五、综合结论\n用通俗易懂的语言总结今日市场状况\n\n### 六、投资建议\n给出具体可操作的建议\n\n注意：用通俗易懂的语言，必须引用真实数据，不要编造。"}, "dependencies": ["factor_discovery", "sector_analysis", "sentiment_calc"]},
+                {"id": "report_synthesis", "name": "综合研究报告", "type": "task", "config": {"type": "llm", "prompt": "基于以上三个分析结果（因子探索、行业轮动、市场情绪），生成一份完整的A股市场综合研究报告。报告格式要求：\n\n## 今日A股市场综合研究报告\n\n### 一、市场概况\n引用market_indices（主要指数涨跌幅）、涨跌家数、涨跌停数、总成交额等数据\n\n### 二、涨停分析\n引用limit_up_pool数据，分析涨停原因、连板情况、板块效应\n\n### 三、行业轮动分析\n指出强势行业和弱势行业，引用行业统计数据\n\n### 四、因子发现\n推荐2-3个有潜力的量化因子及其逻辑\n\n### 五、市场情绪研判\n给出情绪评分(0-100)和偏多/偏空判断\n\n### 六、综合结论与投资建议\n用通俗易懂的语言总结并给出建议\n\n注意：用通俗易懂的语言，必须引用真实数据，不要编造。"}, "dependencies": ["factor_discovery", "sector_analysis", "sentiment_calc"]},
             ],
         },
     },
@@ -510,6 +510,61 @@ async def _execute_tool_node(
                 total = (await session.execute(select(sqlfunc.count()).select_from(StockModel))).scalar() or 0
                 result_data["stocks_count"] = total
                 log_fn(f"数据库: {total} 只股票", node_id=node["id"])
+
+                # --- Market Indices ---
+                try:
+                    import akshare as ak
+                    loop = asyncio.get_event_loop()
+                    indices = {
+                        "上证指数": "sh000001",
+                        "深证成指": "sz399001",
+                        "沪深300": "sh000300",
+                        "创业板指": "sz399006",
+                        "科创50": "sh000688",
+                    }
+                    index_data = {}
+                    for name, symbol in indices.items():
+                        try:
+                            df = await loop.run_in_executor(None, lambda s=symbol: ak.stock_zh_index_daily_em(symbol=s, start_date=(datetime.now().date() - timedelta(days=10)).strftime("%Y%m%d")))
+                            if not df.empty:
+                                latest = df.iloc[-1]
+                                prev = df.iloc[-2] if len(df) > 1 else latest
+                                pct = round((float(latest["close"]) - float(prev["close"])) / float(prev["close"]) * 100, 2) if float(prev["close"]) > 0 else 0
+                                index_data[name] = {
+                                    "close": round(float(latest["close"]), 2),
+                                    "pct_chg": pct,
+                                    "volume_billion": round(float(latest["volume"]) / 1e8, 2),
+                                    "amount_billion": round(float(latest["amount"]) / 1e8, 2),
+                                    "date": str(latest["date"]),
+                                }
+                        except Exception:
+                            pass
+                    if index_data:
+                        result_data["market_indices"] = index_data
+                        log_fn(f"指数数据: {len(index_data)} 个指数", node_id=node["id"])
+                except Exception as e:
+                    log_fn(f"指数数据获取失败: {e}", "warning", node_id=node["id"])
+
+                # --- Limit Up/Down Pool ---
+                try:
+                    import akshare as ak
+                    loop = asyncio.get_event_loop()
+                    # Limit up pool
+                    zt_df = await loop.run_in_executor(None, lambda: ak.stock_zt_pool_em(date=datetime.now().strftime("%Y%m%d")))
+                    if not zt_df.empty:
+                        zt_records = []
+                        for _, row in zt_df.head(20).iterrows():
+                            zt_records.append({
+                                "name": str(row.get("名称", "")),
+                                "ts_code": str(row.get("代码", "")),
+                                "pct_chg": float(row.get("涨跌幅", 0) or 0),
+                                "reason": str(row.get("涨停原因", row.get("连板数", ""))),
+                                "consecutive": int(row.get("连板数", 1) or 1),
+                            })
+                        result_data["limit_up_pool"] = zt_records
+                        log_fn(f"涨停池: {len(zt_records)} 只", node_id=node["id"])
+                except Exception as e:
+                    log_fn(f"涨停池获取失败: {e}", "warning", node_id=node["id"])
 
                 # --- OHLCV Market Statistics ---
                 ohlcv_count = (await session.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))).scalar() or 0

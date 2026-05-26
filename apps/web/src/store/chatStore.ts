@@ -80,43 +80,62 @@ export const useChatStore = create<ChatState>((set, get) => ({
       timestamp: new Date().toISOString(),
     }
 
-    // Add progress placeholder
-    const progressMsg: ChatMessage = {
-      id: nextId(),
-      role: 'progress',
-      content: '正在启动全量研究分析...',
-      timestamp: new Date().toISOString(),
-      nodeStatuses: {},
-      workflowStatus: 'running',
-    }
-
     set((s) => ({
-      messages: [...s.messages, userMsg, progressMsg],
+      messages: [...s.messages, userMsg],
       isRunning: true,
       error: null,
     }))
 
     try {
-      const res = await chatApi.sendResearchMessage(trimmed)
+      // Use smart endpoint that detects intent
+      const res = await chatApi.sendMessage(trimmed)
       if (!res.data.success || !res.data.data) {
-        throw new Error(res.data.message || 'Failed to start research')
+        throw new Error(res.data.message || 'Failed to process message')
       }
 
-      const { run_id } = res.data.data
-      set({ currentRunId: run_id })
+      const data = res.data.data
 
-      // Open WebSocket for real-time progress
-      _connectWs(run_id, set, get, progressMsg.id)
+      if (data.type === 'direct_answer') {
+        // Direct LLM answer - no workflow needed
+        const assistantMsg: ChatMessage = {
+          id: nextId(),
+          role: 'assistant',
+          content: data.content,
+          timestamp: new Date().toISOString(),
+        }
+        set((s) => ({
+          messages: [...s.messages, assistantMsg],
+          isRunning: false,
+        }))
+      } else if (data.run_id) {
+        // Research workflow started
+        const progressMsg: ChatMessage = {
+          id: nextId(),
+          role: 'progress',
+          content: '正在启动全量研究分析...',
+          timestamp: new Date().toISOString(),
+          nodeStatuses: {},
+          workflowStatus: 'running',
+        }
+        set((s) => ({
+          messages: [...s.messages, progressMsg],
+          currentRunId: data.run_id,
+        }))
+        _connectWs(data.run_id, set, get, progressMsg.id)
+      } else {
+        throw new Error('Unexpected response format')
+      }
     } catch (err: any) {
       const errorMsg = err?.message || 'Unknown error'
       set((s) => ({
         isRunning: false,
         error: errorMsg,
-        messages: s.messages.map((m) =>
-          m.id === progressMsg.id
-            ? { ...m, role: 'assistant' as const, content: `研究启动失败: ${errorMsg}`, workflowStatus: 'failed' }
-            : m
-        ),
+        messages: [...s.messages, {
+          id: nextId(),
+          role: 'assistant' as const,
+          content: `处理失败: ${errorMsg}`,
+          timestamp: new Date().toISOString(),
+        }],
       }))
     }
   },

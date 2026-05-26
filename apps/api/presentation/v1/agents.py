@@ -183,6 +183,93 @@ async def chat_research(
     })
 
 
+@router.post("/chat/message")
+async def chat_message(
+    request: ChatResearchRequest,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Smart chat: detect intent, either run research or answer directly."""
+    from quant_os_infra_market.models.ohlcv_model import OHLCVDailyModel
+    from sqlalchemy import func as sqlfunc
+
+    message = request.message.strip()
+    if not message:
+        return ok({"type": "error", "message": "消息不能为空"})
+
+    # Quick keyword-based intent detection (no LLM call needed)
+    research_keywords = [
+        "分析", "研究", "报告", "市场情绪", "行情分析", "因子", "回测",
+        "行业轮动", "综合研究", "量化", "alpha", "策略", "选股",
+        "今日市场", "大盘分析", "涨跌分析", "情绪研判",
+    ]
+    is_research = any(kw in message for kw in research_keywords)
+
+    # Short greetings/questions → direct answer
+    direct_keywords = ["你好", "谢谢", "你是", "什么是", "怎么", "为什么", "帮我", "解释", "告诉我"]
+    is_direct = any(kw in message for kw in direct_keywords) and not is_research
+
+    if is_research and not is_direct:
+        # Delegate to research workflow
+        return await chat_research(request, db)
+
+    # Direct LLM answer with market context
+    settings = get_app_settings()
+    from quant_os_infra_agent.llm.factory import LLMProviderFactory
+    provider = LLMProviderFactory.create(settings.llm.default_provider)
+
+    # Get brief market context
+    ohlcv_count = (await db.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))).scalar() or 0
+    latest_date = None
+    market_brief = ""
+    if ohlcv_count > 0:
+        from sqlalchemy import desc as sql_desc, case
+        latest_date = (await db.execute(
+            select(OHLCVDailyModel.trade_date)
+            .group_by(OHLCVDailyModel.trade_date)
+            .order_by(sqlfunc.count().desc())
+            .limit(1)
+        )).scalar_one_or_none()
+
+        if latest_date:
+            stats = (await db.execute(
+                select(
+                    sqlfunc.count(),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg > 0, 1), else_=0)),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg < 0, 1), else_=0)),
+                    sqlfunc.sum(OHLCVDailyModel.amount),
+                ).where(OHLCVDailyModel.trade_date == latest_date)
+            )).one()
+            market_brief = f"当前数据库: {ohlcv_count}条行情({latest_date}), 涨{stats[1]}/跌{stats[2]}, 成交额{round(float(stats[3] or 0)/1e8)}亿"
+
+    system_prompt = f"""你是 QuantOS AI 量化研究助手。你可以：
+1. 回答关于A股市场、量化投资、金融知识的问题
+2. 解释量化概念、因子、策略
+3. 根据数据库中的市场数据回答具体问题
+
+{market_brief}
+
+回答要简洁专业。如果用户问的是具体数据，可以基于数据库上下文回答。如果需要完整研究报告，请建议用户使用"分析今日市场情绪"等研究指令。"""
+
+    messages = [
+        Message(role=MessageRole.SYSTEM, content=system_prompt),
+        Message(role=MessageRole.USER, content=message),
+    ]
+
+    try:
+        response = await provider.chat(
+            messages,
+            config=LLMConfig(model=settings.llm.mimo_model, temperature=0.5, max_tokens=2000),
+        )
+        return ok({
+            "type": "direct_answer",
+            "content": response.content,
+            "model": response.model,
+            "tokens": response.usage.total_tokens if response.usage else 0,
+        })
+    except Exception as e:
+        return ok({"type": "error", "message": f"LLM 调用失败: {str(e)}"})
+
+
 @router.get("")
 @router.get("/")
 async def list_agents(

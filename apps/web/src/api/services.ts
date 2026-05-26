@@ -251,6 +251,12 @@ export const chatApi = {
       message,
       conversation_id: conversationId,
     }),
+
+  sendMessage: (message: string, conversationId?: string) =>
+    apiClient.post<ApiResponse<any>>('/v1/agents/chat/message', {
+      message,
+      conversation_id: conversationId,
+    }),
 }
 
 // System API
