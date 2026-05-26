@@ -620,21 +620,32 @@ async def _run_agent(
 
     max_iterations = 3
     total_tokens = 0
+    import logging
+    logger = logging.getLogger(__name__)
 
-    for _ in range(max_iterations):
+    for iteration in range(max_iterations):
         try:
+            logger.info("Agent iteration %d: provider=%s, model=%s, messages=%d, tools=%d",
+                        iteration, provider.provider_name, agent_model, len(llm_messages), len(tools))
             response = await provider.chat(
                 llm_messages,
                 tools=tools,
                 config=LLMConfig(model=agent_model, temperature=0.3, max_tokens=3000),
             )
+            logger.info("Agent response: has_tool_calls=%s, tool_calls=%d, content_len=%d, finish_reason=%s",
+                        response.has_tool_calls,
+                        len(response.tool_calls) if response.tool_calls else 0,
+                        len(response.content) if response.content else 0,
+                        response.finish_reason)
         except Exception as e:
+            logger.error("Agent LLM call failed: %s", e, exc_info=True)
             return {"type": "error", "message": f"LLM 调用失败: {str(e)}"}
 
         total_tokens += response.usage.total_tokens if response.usage else 0
 
         # If LLM wants to call tools
         if response.has_tool_calls and response.tool_calls:
+            logger.info("Agent: executing %d tool calls", len(response.tool_calls))
             # Convert tool_calls to OpenAI format for the next message
             tc_dicts = []
             for tc in response.tool_calls:
@@ -657,7 +668,9 @@ async def _run_agent(
             # Execute each tool call and add results
             for tc in response.tool_calls:
                 args = tc.arguments if isinstance(tc.arguments, dict) else {}
+                logger.info("Agent: calling tool %s(%s)", tc.name, args)
                 result = await execute_tool(tc.name, args)
+                logger.info("Agent: tool %s returned %d chars", tc.name, len(result))
                 llm_messages.append(Message(
                     role=MessageRole.TOOL,
                     content=result,
@@ -665,7 +678,8 @@ async def _run_agent(
                 ))
             continue
 
-        # LLM returned a final text answer
+        # LLM returned a final text answer (no tool calls)
+        logger.info("Agent: final answer, content_len=%d", len(response.content) if response.content else 0)
         return {
             "type": "direct_answer",
             "content": response.content or "",
@@ -682,17 +696,21 @@ async def chat_message(
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """AI Agent: LLM with tools, autonomously decides what data to fetch."""
+    import logging
+    logger = logging.getLogger(__name__)
+
     message = request.message.strip()
     if not message:
         return ok({"type": "error", "message": "消息不能为空"})
 
+    logger.info("=== Agent request: %s ===", message[:100])
     try:
         result = await _run_agent(message, db)
+        logger.info("Agent result type: %s, content_len: %d", result.get("type"), len(result.get("content", "")))
         if result.get("type") not in ("direct_answer", "error"):
             result = {"type": "direct_answer", "content": str(result)}
         return ok(result)
     except Exception as e:
-        import logging
         logging.getLogger(__name__).error("Agent error: %s", e, exc_info=True)
         # Fallback: direct LLM answer without tools
         try:
