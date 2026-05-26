@@ -196,8 +196,18 @@ async def _run_agent(
     provider = LLMProviderFactory.create("deepseek")
     agent_model = settings.llm.deepseek_model
 
-    # Get tool definitions from registry (single source of truth)
-    tools = tool_registry.get_tool_definitions()
+    # Get tool definitions from registry (single source of truth).
+    # Filter to only include tools with simple parameter types (STRING/INTEGER/NUMBER/BOOLEAN)
+    # compatible with all LLM function-calling APIs.
+    SAFE_TOOL_NAMES = {
+        "query_market_overview", "query_market_distribution", "query_indices",
+        "query_limit_up", "query_limit_down", "query_consecutive_limit_up",
+        "query_sector", "query_sector_ranking", "query_top_stocks",
+        "query_volume_leaders", "query_dragon_tiger",
+        "query_stock", "query_stock_history", "search_stocks_by_name",
+    }
+    all_tool_defs = tool_registry.get_tool_definitions()
+    tools = [t for t in all_tool_defs if t.name in SAFE_TOOL_NAMES]
 
     # --- Tool execution (thin wrapper around registry) ---
     async def execute_tool(name: str, args: dict) -> str:

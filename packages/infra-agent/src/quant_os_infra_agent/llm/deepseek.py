@@ -67,6 +67,10 @@ class DeepSeekProvider(BaseLLMProvider):
 
         except httpx.HTTPStatusError as e:
             logger.error("DeepSeek API error: %s - %s", e.response.status_code, e.response.text)
+            # Log request details for 400 errors to help debugging
+            if e.response.status_code == 400:
+                logger.error("DeepSeek 400 request payload snippet: tools=%d, model=%s",
+                             len(tools) if tools else 0, payload.get("model"))
             if e.response.status_code == 429:
                 from quant_os_shared.errors import LLMRateLimitError
                 raise LLMRateLimitError("DeepSeek rate limit exceeded") from e
