@@ -167,6 +167,10 @@ class DeepSeekProvider(BaseLLMProvider):
             "stream": stream,
         }
 
+        # DeepSeek v4-pro: disable thinking mode — agent doesn't need deep reasoning,
+        # and reasoning_content must be round-tripped which adds complexity.
+        payload["thinking"] = {"type": "disabled"}
+
         # DeepSeek: frequency_penalty / presence_penalty are deprecated, skip them.
         if config.stop:
             payload["stop"] = config.stop
