@@ -67,10 +67,10 @@ class QdrantSettings(BaseSettings):
 
 class LLMSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="")
-    default_provider: str = Field(default="mimo", alias="LLM_DEFAULT_PROVIDER")
+    default_provider: str = Field(default="deepseek", alias="LLM_DEFAULT_PROVIDER")
     deepseek_api_key: str = Field(default="", alias="DEEPSEEK_API_KEY")
     deepseek_base_url: str = Field(default="https://api.deepseek.com", alias="DEEPSEEK_BASE_URL")
-    deepseek_model: str = Field(default="deepseek-chat", alias="DEEPSEEK_MODEL")
+    deepseek_model: str = Field(default="deepseek-v4-pro", alias="DEEPSEEK_MODEL")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_base_url: str = Field(default="", alias="OPENAI_BASE_URL")
     openai_model: str = Field(default="gpt-4o", alias="OPENAI_MODEL")
