@@ -167,7 +167,10 @@ class OpenAIProvider(BaseLLMProvider):
 
         if tools:
             payload["tools"] = [t.to_dict() for t in tools]
-            payload["tool_choice"] = "auto"
+            if not config.tool_choice:
+                payload["tool_choice"] = "auto"
+            else:
+                payload["tool_choice"] = config.tool_choice
 
         return payload
 

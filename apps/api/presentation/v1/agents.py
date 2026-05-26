@@ -627,10 +627,11 @@ async def _run_agent(
         try:
             logger.info("Agent iteration %d: provider=%s, model=%s, messages=%d, tools=%d",
                         iteration, provider.provider_name, agent_model, len(llm_messages), len(tools))
+            logger.info("Agent tool names: %s", [t.name for t in tools])
             response = await provider.chat(
                 llm_messages,
                 tools=tools,
-                config=LLMConfig(model=agent_model, temperature=0.3, max_tokens=3000),
+                config=LLMConfig(model=agent_model, temperature=0.3, max_tokens=3000, tool_choice="required"),
             )
             logger.info("Agent response: has_tool_calls=%s, tool_calls=%d, content_len=%d, finish_reason=%s",
                         response.has_tool_calls,

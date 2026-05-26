@@ -107,6 +107,7 @@ class LLMConfig:
     presence_penalty: float = 0.0
     stop: list[str] | None = None
     stream: bool = False
+    tool_choice: str | None = None
 
 
 @dataclass
