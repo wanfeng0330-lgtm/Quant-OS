@@ -183,43 +183,261 @@ async def chat_research(
     })
 
 
-async def _detect_intent(message: str) -> str:
-    """LLM-based intent detection with clear guidance."""
+async def _run_agent(
+    message: str,
+    db: AsyncSession,
+) -> dict[str, Any]:
+    """Agent loop: LLM with tools, decides what to call, iterates until done."""
+    from quant_os_infra_agent.llm.base import ToolDefinition, ToolCall
+    from quant_os_infra_market.models.ohlcv_model import OHLCVDailyModel
+    from quant_os_infra_market.models.stock_model import StockModel
+    from quant_os_infra_market.models.dragon_tiger_model import DragonTigerModel
+    from sqlalchemy import func as sqlfunc, desc as sql_desc, case
+
     settings = get_app_settings()
     provider = LLMProviderFactory.create(settings.llm.default_provider)
-    classify_messages = [
-        Message(
-            role=MessageRole.SYSTEM,
-            content=(
-                "你是意图分类器。判断用户是想「获取市场数据做研究」还是「普通对话」。\n\n"
-                "research：用户明确要求获取、查看、分析实时A股市场数据。例如：\n"
-                "- 今日市场/大盘/行情怎么样\n"
-                "- 分析一下今天的市场\n"
-                "- 涨停板/跌停板有哪些\n"
-                "- 板块轮动/行业分析\n"
-                "- 市场情绪研判\n"
-                "- 帮我研究一下XX\n"
-                "- 生成研究报告\n\n"
-                "chat：用户在聊天、问概念、问操作方法、闲聊。例如：\n"
-                "- 你好/谢谢\n"
-                "- 什么是量化/因子/IC\n"
-                "- 怎么使用这个系统\n"
-                "- 帮我解释一下XX概念\n"
-                "- 你觉得XX怎么样（观点类问题）\n\n"
-                "只回复一个词：research 或 chat"
-            ),
+
+    # --- Tool definitions ---
+    tools = [
+        ToolDefinition(
+            name="query_market_overview",
+            description="查询A股市场整体概况：涨跌家数、涨跌停数、成交额、平均涨跌幅等",
+            parameters={"type": "object", "properties": {}, "required": []},
         ),
+        ToolDefinition(
+            name="query_indices",
+            description="查询主要市场指数（上证指数、深证成指、沪深300、创业板指、科创50）的最新行情",
+            parameters={"type": "object", "properties": {}, "required": []},
+        ),
+        ToolDefinition(
+            name="query_limit_up",
+            description="查询今日涨停板个股列表，含涨停原因、连板数、所属行业",
+            parameters={"type": "object", "properties": {"limit": {"type": "integer", "description": "返回条数，默认20"}}, "required": []},
+        ),
+        ToolDefinition(
+            name="query_sector",
+            description="查询指定板块/行业的个股行情。可按行业名称筛选，返回该行业股票的涨跌幅、成交额等",
+            parameters={"type": "object", "properties": {
+                "sector": {"type": "string", "description": "行业名称，如'通信'、'电子'、'银行'、'医药'等"},
+                "limit": {"type": "integer", "description": "返回条数，默认20"},
+            }, "required": ["sector"]},
+        ),
+        ToolDefinition(
+            name="query_top_stocks",
+            description="查询涨幅榜、跌幅榜或成交额排行",
+            parameters={"type": "object", "properties": {
+                "sort_by": {"type": "string", "enum": ["gainers", "losers", "volume"], "description": "排序方式：gainers=涨幅榜, losers=跌幅榜, volume=成交额榜"},
+                "limit": {"type": "integer", "description": "返回条数，默认15"},
+            }, "required": ["sort_by"]},
+        ),
+        ToolDefinition(
+            name="query_dragon_tiger",
+            description="查询龙虎榜数据，含买卖金额、净额、上榜原因",
+            parameters={"type": "object", "properties": {"limit": {"type": "integer", "description": "返回条数，默认20"}}, "required": []},
+        ),
+        ToolDefinition(
+            name="query_stock",
+            description="查询单只股票的最新行情数据",
+            parameters={"type": "object", "properties": {
+                "ts_code": {"type": "string", "description": "股票代码，如'000001.SZ'、'600519.SH'"},
+            }, "required": ["ts_code"]},
+        ),
+    ]
+
+    # --- Tool execution ---
+    async def execute_tool(name: str, args: dict) -> str:
+        import json as _json
+        try:
+            if name == "query_market_overview":
+                ohlcv_count = (await db.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))).scalar() or 0
+                if ohlcv_count == 0:
+                    return _json.dumps({"error": "无行情数据"}, ensure_ascii=False)
+                latest_date = (await db.execute(
+                    select(OHLCVDailyModel.trade_date).group_by(OHLCVDailyModel.trade_date)
+                    .order_by(sqlfunc.count().desc()).limit(1)
+                )).scalar_one_or_none()
+                stats = (await db.execute(select(
+                    sqlfunc.count(),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg > 0, 1), else_=0)),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg < 0, 1), else_=0)),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg >= 9.9, 1), else_=0)),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg <= -9.9, 1), else_=0)),
+                    sqlfunc.sum(OHLCVDailyModel.amount),
+                    sqlfunc.avg(OHLCVDailyModel.pct_chg),
+                ).where(OHLCVDailyModel.trade_date == latest_date))).one()
+                return _json.dumps({
+                    "date": str(latest_date), "total": int(stats[0]),
+                    "up": int(stats[1] or 0), "down": int(stats[2] or 0),
+                    "limit_up": int(stats[3] or 0), "limit_down": int(stats[4] or 0),
+                    "amount_billion": round(float(stats[5] or 0) / 1e8, 2),
+                    "avg_pct_chg": round(float(stats[6] or 0), 2),
+                }, ensure_ascii=False)
+
+            elif name == "query_indices":
+                import akshare as ak
+                loop = asyncio.get_event_loop()
+                indices = {"上证指数": "sh000001", "深证成指": "sz399001", "沪深300": "sh000300", "创业板指": "sz399006", "科创50": "sh000688"}
+                from datetime import timedelta
+                sd = (datetime.now().date() - timedelta(days=10)).strftime("%Y%m%d")
+                result = {}
+                for n, s in indices.items():
+                    try:
+                        df = await loop.run_in_executor(None, lambda s=s: ak.stock_zh_index_daily_em(symbol=s, start_date=sd))
+                        if not df.empty:
+                            latest = df.iloc[-1]
+                            prev = df.iloc[-2] if len(df) > 1 else latest
+                            pct = round((float(latest["close"]) - float(prev["close"])) / float(prev["close"]) * 100, 2) if float(prev["close"]) > 0 else 0
+                            result[n] = {"close": round(float(latest["close"]), 2), "pct_chg": pct}
+                    except Exception:
+                        pass
+                return _json.dumps(result, ensure_ascii=False)
+
+            elif name == "query_limit_up":
+                import akshare as ak
+                loop = asyncio.get_event_loop()
+                zt_df = await loop.run_in_executor(None, lambda: ak.stock_zt_pool_em(date=datetime.now().strftime("%Y%m%d")))
+                if zt_df.empty:
+                    return _json.dumps({"error": "今日无涨停数据"}, ensure_ascii=False)
+                limit = args.get("limit", 20)
+                records = []
+                for _, row in zt_df.head(limit).iterrows():
+                    cols = list(zt_df.columns)
+                    records.append({
+                        "name": str(row.iloc[2]) if len(cols) > 2 else "",
+                        "code": str(row.iloc[1]) if len(cols) > 1 else "",
+                        "pct_chg": round(float(row.iloc[3]), 2) if len(cols) > 3 else 0,
+                        "consecutive": int(row.iloc[14]) if len(cols) > 14 else 1,
+                        "industry": str(row.iloc[15]) if len(cols) > 15 else "",
+                    })
+                return _json.dumps(records, ensure_ascii=False)
+
+            elif name == "query_sector":
+                sector = args.get("sector", "")
+                limit = args.get("limit", 20)
+                ohlcv_count = (await db.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))).scalar() or 0
+                if ohlcv_count == 0:
+                    return _json.dumps({"error": "无行情数据"}, ensure_ascii=False)
+                latest_date = (await db.execute(
+                    select(OHLCVDailyModel.trade_date).group_by(OHLCVDailyModel.trade_date)
+                    .order_by(sqlfunc.count().desc()).limit(1)
+                )).scalar_one_or_none()
+                # Join with StockModel to filter by industry
+                rows = (await db.execute(
+                    select(StockModel.name, StockModel.ts_code, OHLCVDailyModel.close, OHLCVDailyModel.pct_chg, OHLCVDailyModel.amount, OHLCVDailyModel.volume)
+                    .join(OHLCVDailyModel, StockModel.ts_code == OHLCVDailyModel.ts_code)
+                    .where(OHLCVDailyModel.trade_date == latest_date)
+                    .where(StockModel.industry.ilike(f"%{sector}%"))
+                    .order_by(sql_desc(OHLCVDailyModel.pct_chg))
+                    .limit(limit)
+                )).all()
+                if not rows:
+                    return _json.dumps({"error": f"未找到'{sector}'相关板块数据", "hint": "请检查行业名称，如通信、电子、银行、医药等"}, ensure_ascii=False)
+                return _json.dumps({
+                    "sector": sector, "date": str(latest_date), "count": len(rows),
+                    "stocks": [{"name": r[0], "ts_code": r[1], "close": float(r[2]), "pct_chg": float(r[3]), "amount_billion": round(float(r[4] or 0) / 1e8, 2)} for r in rows],
+                }, ensure_ascii=False)
+
+            elif name == "query_top_stocks":
+                sort_by = args.get("sort_by", "gainers")
+                limit = args.get("limit", 15)
+                latest_date = (await db.execute(
+                    select(OHLCVDailyModel.trade_date).group_by(OHLCVDailyModel.trade_date)
+                    .order_by(sqlfunc.count().desc()).limit(1)
+                )).scalar_one_or_none()
+                if not latest_date:
+                    return _json.dumps({"error": "无行情数据"}, ensure_ascii=False)
+                q = select(StockModel.name, OHLCVDailyModel.ts_code, OHLCVDailyModel.close, OHLCVDailyModel.pct_chg, OHLCVDailyModel.amount).join(OHLCVDailyModel, StockModel.ts_code == OHLCVDailyModel.ts_code).where(OHLCVDailyModel.trade_date == latest_date)
+                if sort_by == "gainers":
+                    q = q.order_by(sql_desc(OHLCVDailyModel.pct_chg))
+                elif sort_by == "losers":
+                    q = q.order_by(OHLCVDailyModel.pct_chg)
+                else:
+                    q = q.order_by(sql_desc(OHLCVDailyModel.amount))
+                rows = (await db.execute(q.limit(limit))).all()
+                return _json.dumps([{"name": r[0], "ts_code": r[1], "close": float(r[2]), "pct_chg": float(r[3]), "amount_billion": round(float(r[4] or 0) / 1e8, 2)} for r in rows], ensure_ascii=False)
+
+            elif name == "query_dragon_tiger":
+                limit = args.get("limit", 20)
+                rows = (await db.execute(
+                    select(DragonTigerModel).order_by(DragonTigerModel.trade_date.desc()).limit(limit)
+                )).scalars().all()
+                return _json.dumps([{"name": getattr(r, "name", None) or r.ts_code, "ts_code": r.ts_code, "reason": r.reason, "buy_amount": float(r.buy_amount or 0), "sell_amount": float(r.sell_amount or 0), "net_amount": float(r.net_amount or 0), "date": str(r.trade_date)} for r in rows], ensure_ascii=False)
+
+            elif name == "query_stock":
+                ts_code = args.get("ts_code", "")
+                stock = (await db.execute(select(StockModel).where(StockModel.ts_code == ts_code))).scalar_one_or_none()
+                if not stock:
+                    return _json.dumps({"error": f"股票{ts_code}不存在"}, ensure_ascii=False)
+                latest = (await db.execute(select(OHLCVDailyModel).where(OHLCVDailyModel.ts_code == ts_code).order_by(OHLCVDailyModel.trade_date.desc()).limit(1))).scalar_one_or_none()
+                if not latest:
+                    return _json.dumps({"name": stock.name, "ts_code": ts_code, "error": "无行情数据"}, ensure_ascii=False)
+                return _json.dumps({"name": stock.name, "ts_code": ts_code, "industry": stock.industry, "close": float(latest.close), "pct_chg": float(latest.pct_chg), "volume": float(latest.volume), "amount": float(latest.amount or 0), "date": str(latest.trade_date)}, ensure_ascii=False)
+
+            else:
+                return _json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False)
+        except Exception as e:
+            return _json.dumps({"error": str(e)}, ensure_ascii=False)
+
+    # --- Agent loop ---
+    system_prompt = (
+        "你是 QuantOS AI 量化研究助手。你拥有工具可以查询A股市场实时数据。\n"
+        "根据用户的问题，自主决定调用哪些工具获取数据，然后基于真实数据给出专业分析。\n"
+        "规则：\n"
+        "- 需要数据时主动调用工具，不要猜测或编造数据\n"
+        "- 可以多次调用不同工具来获取全面信息\n"
+        "- 回答要基于工具返回的真实数据，用数据说话\n"
+        "- 回答简洁专业，同时通俗易懂"
+    )
+
+    llm_messages = [
+        Message(role=MessageRole.SYSTEM, content=system_prompt),
         Message(role=MessageRole.USER, content=message),
     ]
-    try:
-        resp = await provider.chat(
-            classify_messages,
-            config=LLMConfig(model=settings.llm.mimo_model, temperature=0, max_tokens=10),
-        )
-        result = (resp.content or "").strip().lower()
-        return "research" if "research" in result else "chat"
-    except Exception:
-        return "chat"
+
+    max_iterations = 5
+    total_tokens = 0
+
+    for _ in range(max_iterations):
+        try:
+            response = await provider.chat(
+                llm_messages,
+                tools=tools,
+                config=LLMConfig(model=settings.llm.mimo_model, temperature=0.3, max_tokens=3000),
+            )
+        except Exception as e:
+            return {"type": "error", "message": f"LLM 调用失败: {str(e)}"}
+
+        total_tokens += response.usage.total_tokens if response.usage else 0
+
+        # If LLM wants to call tools
+        if response.has_tool_calls and response.tool_calls:
+            # Add assistant message with tool_calls
+            llm_messages.append(Message(
+                role=MessageRole.ASSISTANT,
+                content=response.content or "",
+                tool_calls=[tc.__dict__ if hasattr(tc, '__dict__') else tc for tc in response.tool_calls],
+            ))
+
+            # Execute each tool call and add results
+            for tc in response.tool_calls:
+                args = tc.arguments if isinstance(tc.arguments, dict) else {}
+                result = await execute_tool(tc.name, args)
+                llm_messages.append(Message(
+                    role=MessageRole.TOOL,
+                    content=result,
+                    tool_call_id=tc.id,
+                ))
+            continue
+
+        # LLM returned a final text answer
+        return {
+            "type": "direct_answer",
+            "content": response.content or "",
+            "model": response.model,
+            "tokens": total_tokens,
+        }
+
+    return {"type": "error", "message": "Agent 达到最大迭代次数"}
 
 
 @router.post("/chat/message")
@@ -227,80 +445,16 @@ async def chat_message(
     request: ChatResearchRequest,
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    """Smart chat: LLM decides whether to run research or answer directly."""
-    from quant_os_infra_market.models.ohlcv_model import OHLCVDailyModel
-    from sqlalchemy import func as sqlfunc
-
+    """AI Agent: LLM with tools, autonomously decides what data to fetch."""
     message = request.message.strip()
     if not message:
         return ok({"type": "error", "message": "消息不能为空"})
 
-    # Let LLM decide: research workflow or direct chat
-    intent = await _detect_intent(message)
-    if intent == "research":
-        return await chat_research(request, db)
-
-    # Direct LLM answer with market context
-    settings = get_app_settings()
-    provider = LLMProviderFactory.create(settings.llm.default_provider)
-
-    # Get brief market context
-    ohlcv_count = (await db.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))).scalar() or 0
-    latest_date = None
-    market_brief = ""
-    if ohlcv_count > 0:
-        from sqlalchemy import case
-        latest_date = (await db.execute(
-            select(OHLCVDailyModel.trade_date)
-            .group_by(OHLCVDailyModel.trade_date)
-            .order_by(sqlfunc.count().desc())
-            .limit(1)
-        )).scalar_one_or_none()
-
-        if latest_date:
-            stats = (await db.execute(
-                select(
-                    sqlfunc.count(),
-                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg > 0, 1), else_=0)),
-                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg < 0, 1), else_=0)),
-                    sqlfunc.sum(OHLCVDailyModel.amount),
-                ).where(OHLCVDailyModel.trade_date == latest_date)
-            )).one()
-            market_brief = f"当前数据库: {ohlcv_count}条行情({latest_date}), 涨{stats[1]}/跌{stats[2]}, 成交额{round(float(stats[3] or 0)/1e8)}亿"
-
-    system_prompt = f"""你是 QuantOS AI 量化研究助手。你是没有工具调用能力，只能基于数据库信息进行回答。
-
-你的职责：
-1. 回答关于A股市场、量化投资、金融知识的问题
-2. 解释量化概念、因子、策略
-3. 根据下方提供的市场数据摘要回答具体问题
-
-{market_brief}
-
-重要规则：
-- 你不能调用任何工具、API或外部数据源。不要生成tool_call、function_call或任何代码块。
-- 直接用文字回答用户问题，基于你已有的知识和上方提供的数据。
-- 如果用户需要实时市场分析、板块行情、涨跌停分析等需要完整数据的研究，请直接告诉用户："这个需求需要运行完整研究分析，请输入'分析今日市场'等指令来触发。"
-- 回答要简洁专业，但同时要易懂。"""
-
-    llm_messages = [
-        Message(role=MessageRole.SYSTEM, content=system_prompt),
-        Message(role=MessageRole.USER, content=message),
-    ]
-
     try:
-        response = await provider.chat(
-            llm_messages,
-            config=LLMConfig(model=settings.llm.mimo_model, temperature=0.5, max_tokens=2000),
-        )
-        return ok({
-            "type": "direct_answer",
-            "content": response.content,
-            "model": response.model,
-            "tokens": response.usage.total_tokens if response.usage else 0,
-        })
+        result = await _run_agent(message, db)
+        return ok(result)
     except Exception as e:
-        return ok({"type": "error", "message": f"LLM 调用失败: {str(e)}"})
+        return ok({"type": "error", "message": f"Agent 执行失败: {str(e)}"})
 
 
 @router.get("")
