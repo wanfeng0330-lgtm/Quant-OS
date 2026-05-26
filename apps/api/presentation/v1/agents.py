@@ -183,12 +183,39 @@ async def chat_research(
     })
 
 
+async def _detect_intent(message: str) -> str:
+    """Use LLM to classify user intent as 'research' or 'chat'."""
+    settings = get_app_settings()
+    provider = LLMProviderFactory.create(settings.llm.default_provider)
+    classify_messages = [
+        Message(
+            role=MessageRole.SYSTEM,
+            content=(
+                "你是一个意图分类器。判断用户消息是需要「研究分析」还是「日常对话」。\n"
+                "研究分析：需要对A股市场进行深度分析、生成研究报告、量化因子分析、回测策略、情绪研判等。\n"
+                "日常对话：闲聊问候、概念解释、知识问答、操作指导等不需要跑完整研究流程的对话。\n\n"
+                "只回复一个词：research 或 chat"
+            ),
+        ),
+        Message(role=MessageRole.USER, content=message),
+    ]
+    try:
+        resp = await provider.chat(
+            classify_messages,
+            config=LLMConfig(model=settings.llm.mimo_model, temperature=0, max_tokens=10),
+        )
+        result = (resp.content or "").strip().lower()
+        return "research" if "research" in result else "chat"
+    except Exception:
+        return "chat"
+
+
 @router.post("/chat/message")
 async def chat_message(
     request: ChatResearchRequest,
     db: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    """Smart chat: detect intent, either run research or answer directly."""
+    """Smart chat: LLM decides whether to run research or answer directly."""
     from quant_os_infra_market.models.ohlcv_model import OHLCVDailyModel
     from sqlalchemy import func as sqlfunc
 
@@ -196,25 +223,13 @@ async def chat_message(
     if not message:
         return ok({"type": "error", "message": "消息不能为空"})
 
-    # Quick keyword-based intent detection (no LLM call needed)
-    research_keywords = [
-        "分析", "研究", "报告", "市场情绪", "行情分析", "因子", "回测",
-        "行业轮动", "综合研究", "量化", "alpha", "策略", "选股",
-        "今日市场", "大盘分析", "涨跌分析", "情绪研判",
-    ]
-    is_research = any(kw in message for kw in research_keywords)
-
-    # Short greetings/questions → direct answer
-    direct_keywords = ["你好", "谢谢", "你是", "什么是", "怎么", "为什么", "帮我", "解释", "告诉我"]
-    is_direct = any(kw in message for kw in direct_keywords) and not is_research
-
-    if is_research and not is_direct:
-        # Delegate to research workflow
+    # Let LLM decide: research workflow or direct chat
+    intent = await _detect_intent(message)
+    if intent == "research":
         return await chat_research(request, db)
 
     # Direct LLM answer with market context
     settings = get_app_settings()
-    from quant_os_infra_agent.llm.factory import LLMProviderFactory
     provider = LLMProviderFactory.create(settings.llm.default_provider)
 
     # Get brief market context
@@ -222,7 +237,7 @@ async def chat_message(
     latest_date = None
     market_brief = ""
     if ohlcv_count > 0:
-        from sqlalchemy import desc as sql_desc, case
+        from sqlalchemy import case
         latest_date = (await db.execute(
             select(OHLCVDailyModel.trade_date)
             .group_by(OHLCVDailyModel.trade_date)
@@ -250,14 +265,14 @@ async def chat_message(
 
 回答要简洁专业。如果用户问的是具体数据，可以基于数据库上下文回答。如果需要完整研究报告，请建议用户使用"分析今日市场情绪"等研究指令。"""
 
-    messages = [
+    llm_messages = [
         Message(role=MessageRole.SYSTEM, content=system_prompt),
         Message(role=MessageRole.USER, content=message),
     ]
 
     try:
         response = await provider.chat(
-            messages,
+            llm_messages,
             config=LLMConfig(model=settings.llm.mimo_model, temperature=0.5, max_tokens=2000),
         )
         return ok({

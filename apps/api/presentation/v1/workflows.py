@@ -91,7 +91,7 @@ RESEARCH_WORKFLOW_TEMPLATES: dict[str, dict[str, Any]] = {
                 {"id": "data_sync", "name": "全量数据同步", "type": "task", "config": {"type": "tool", "tool": "sync_all_market_data"}, "dependencies": []},
                 # Layer 1: 并行分析（依赖数据同步完成）
                 {"id": "factor_discovery", "name": "因子探索与发现", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的market_overview、top_gainers、top_losers、top_volume等真实数据，发现并评估有潜力的Alpha因子。给出2-3个具体因子公式（如动量因子、量价因子），解释其经济逻辑和适用场景。"}, "dependencies": ["data_sync"]},
-                {"id": "sector_analysis", "name": "行业轮动分析", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的industry_stats（行业涨跌统计）、top_gainers/top_losers（涨跌幅排行）、dragon_tiger_entries（龙虎榜）数据，分析行业轮动趋势。指出当前强势行业和弱势行业，分析资金集中方向。"}, "dependencies": ["data_sync"]},
+                {"id": "sector_analysis", "name": "行业轮动分析", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的limit_up_industries（涨停板块分布）、limit_up_pool（涨停股详情）、top_gainers/top_losers（涨跌幅排行）、dragon_tiger_entries（龙虎榜）数据，分析行业轮动趋势。指出当前强势行业和弱势行业，分析资金集中方向。"}, "dependencies": ["data_sync"]},
                 {"id": "sentiment_calc", "name": "市场情绪研判", "type": "task", "config": {"type": "llm", "prompt": "基于数据上下文中的market_overview（涨跌家数、涨跌停数、成交额）、market_indices（主要指数涨跌幅）、limit_up_pool（涨停股及原因）、dragon_tiger_entries（龙虎榜）数据，综合分析市场情绪。给出情绪评分(0-100)、情绪偏多/偏空判断、以及情绪变化趋势。"}, "dependencies": ["data_sync"]},
                 # Layer 2: 综合报告（依赖所有分析完成）
                 {"id": "report_synthesis", "name": "综合研究报告", "type": "task", "config": {"type": "llm", "prompt": "基于以上三个分析结果（因子探索、行业轮动、市场情绪），生成一份完整的A股市场综合研究报告。报告格式要求：\n\n## 今日A股市场综合研究报告\n\n### 一、市场概况\n引用market_indices（主要指数涨跌幅）、涨跌家数、涨跌停数、总成交额等数据\n\n### 二、涨停分析\n引用limit_up_pool数据，分析涨停原因、连板情况、板块效应\n\n### 三、行业轮动分析\n指出强势行业和弱势行业，引用行业统计数据\n\n### 四、因子发现\n推荐2-3个有潜力的量化因子及其逻辑\n\n### 五、市场情绪研判\n给出情绪评分(0-100)和偏多/偏空判断\n\n### 六、综合结论与投资建议\n用通俗易懂的语言总结并给出建议\n\n注意：用通俗易懂的语言，必须引用真实数据，不要编造。"}, "dependencies": ["factor_discovery", "sector_analysis", "sentiment_calc"]},
@@ -549,19 +549,31 @@ async def _execute_tool_node(
                 try:
                     import akshare as ak
                     loop = asyncio.get_event_loop()
-                    # Limit up pool
                     zt_df = await loop.run_in_executor(None, lambda: ak.stock_zt_pool_em(date=datetime.now().strftime("%Y%m%d")))
                     if not zt_df.empty:
                         zt_records = []
                         for _, row in zt_df.head(20).iterrows():
+                            cols = list(zt_df.columns)
                             zt_records.append({
-                                "name": str(row.get("名称", "")),
-                                "ts_code": str(row.get("代码", "")),
-                                "pct_chg": float(row.get("涨跌幅", 0) or 0),
-                                "reason": str(row.get("涨停原因", row.get("连板数", ""))),
-                                "consecutive": int(row.get("连板数", 1) or 1),
+                                "name": str(row.iloc[2]) if len(cols) > 2 else "",
+                                "code": str(row.iloc[1]) if len(cols) > 1 else "",
+                                "pct_chg": round(float(row.iloc[3]), 2) if len(cols) > 3 else 0,
+                                "price": float(row.iloc[4]) if len(cols) > 4 else 0,
+                                "amount_billion": round(float(row.iloc[5]) / 1e8, 2) if len(cols) > 5 else 0,
+                                "turnover": round(float(row.iloc[8]), 2) if len(cols) > 8 else 0,
+                                "seal_money_billion": round(float(row.iloc[9]) / 1e8, 2) if len(cols) > 9 else 0,
+                                "first_seal_time": str(row.iloc[10]) if len(cols) > 10 else "",
+                                "last_seal_time": str(row.iloc[11]) if len(cols) > 11 else "",
+                                "explosion_count": int(row.iloc[12]) if len(cols) > 12 else 0,
+                                "limit_stats": str(row.iloc[13]) if len(cols) > 13 else "",
+                                "consecutive": int(row.iloc[14]) if len(cols) > 14 else 1,
+                                "industry": str(row.iloc[15]) if len(cols) > 15 else "",
                             })
                         result_data["limit_up_pool"] = zt_records
+                        # Count by industry
+                        from collections import Counter
+                        ind_counts = Counter(r["industry"] for r in zt_records if r["industry"])
+                        result_data["limit_up_industries"] = [{"name": k, "count": v} for k, v in ind_counts.most_common(10)]
                         log_fn(f"涨停池: {len(zt_records)} 只", node_id=node["id"])
                 except Exception as e:
                     log_fn(f"涨停池获取失败: {e}", "warning", node_id=node["id"])
@@ -649,34 +661,6 @@ async def _execute_tool_node(
                 else:
                     result_data["market_overview"] = {"error": "无行情数据，请先执行数据同步"}
                     log_fn("OHLCV: 无数据", "warning", node_id=node["id"])
-
-                # --- Industry Stats (join OHLCV with Stock for industry) ---
-                if latest_date:
-                    industry_stats = await session.execute(
-                        select(
-                            StockModel.industry,
-                            sqlfunc.count().label("stock_count"),
-                            sqlfunc.avg(OHLCVDailyModel.pct_chg).label("avg_pct_chg"),
-                            sqlfunc.sum(OHLCVDailyModel.amount).label("total_amount"),
-                        )
-                        .join(OHLCVDailyModel, StockModel.ts_code == OHLCVDailyModel.ts_code)
-                        .where(OHLCVDailyModel.trade_date == latest_date)
-                        .where(StockModel.industry.isnot(None))
-                        .group_by(StockModel.industry)
-                        .order_by(sql_desc(sqlfunc.avg(OHLCVDailyModel.pct_chg)))
-                        .limit(30)
-                    )
-                    ind_rows = industry_stats.all()
-                    result_data["industry_stats"] = [
-                        {
-                            "name": r[0],
-                            "stock_count": int(r[1]),
-                            "avg_pct_chg": round(float(r[2] or 0), 2),
-                            "total_amount_billion": round(float(r[3] or 0) / 1e8, 2),
-                        }
-                        for r in ind_rows
-                    ]
-                    log_fn(f"行业统计: {len(ind_rows)} 个行业", node_id=node["id"])
 
                 # --- Dragon Tiger ---
                 dt_count = (await session.execute(select(sqlfunc.count()).select_from(DragonTigerModel))).scalar() or 0
