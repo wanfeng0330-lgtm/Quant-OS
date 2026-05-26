@@ -242,6 +242,29 @@ async def _run_agent(
                 "ts_code": {"type": "string", "description": "股票代码，如'000001.SZ'、'600519.SH'"},
             }, "required": ["ts_code"]},
         ),
+        ToolDefinition(
+            name="query_sector_ranking",
+            description="查询所有行业板块的涨跌幅排行，返回每个行业的平均涨跌幅、涨跌家数、成交额。用于回答'哪个板块涨得最猛'、'板块排行'等问题",
+            parameters={"type": "object", "properties": {
+                "limit": {"type": "integer", "description": "返回条数，默认30"},
+                "sort_by": {"type": "string", "enum": ["gainers", "losers"], "description": "排序方式，默认gainers"},
+            }, "required": []},
+        ),
+        ToolDefinition(
+            name="query_stock_history",
+            description="查询单只股票最近N天的历史行情数据",
+            parameters={"type": "object", "properties": {
+                "ts_code": {"type": "string", "description": "股票代码，如'000001.SZ'"},
+                "days": {"type": "integer", "description": "天数，默认10"},
+            }, "required": ["ts_code"]},
+        ),
+        ToolDefinition(
+            name="search_stocks",
+            description="按股票名称模糊搜索，返回匹配的股票列表",
+            parameters={"type": "object", "properties": {
+                "keyword": {"type": "string", "description": "搜索关键词，如'茅台'、'宁德'"},
+            }, "required": ["keyword"]},
+        ),
     ]
 
     # --- Tool execution ---
@@ -373,6 +396,64 @@ async def _run_agent(
                     return _json.dumps({"name": stock.name, "ts_code": ts_code, "error": "无行情数据"}, ensure_ascii=False)
                 return _json.dumps({"name": stock.name, "ts_code": ts_code, "industry": stock.industry, "close": float(latest.close), "pct_chg": float(latest.pct_chg), "volume": float(latest.volume), "amount": float(latest.amount or 0), "date": str(latest.trade_date)}, ensure_ascii=False)
 
+            elif name == "query_sector_ranking":
+                sort_by = args.get("sort_by", "gainers")
+                limit = args.get("limit", 30)
+                ohlcv_count = (await db.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))).scalar() or 0
+                if ohlcv_count == 0:
+                    return _json.dumps({"error": "无行情数据"}, ensure_ascii=False)
+                latest_date = (await db.execute(
+                    select(OHLCVDailyModel.trade_date).group_by(OHLCVDailyModel.trade_date)
+                    .order_by(sqlfunc.count().desc()).limit(1)
+                )).scalar_one_or_none()
+                order = sql_desc(sqlfunc.avg(OHLCVDailyModel.pct_chg)) if sort_by == "gainers" else sqlfunc.avg(OHLCVDailyModel.pct_chg)
+                rows = (await db.execute(
+                    select(
+                        StockModel.industry,
+                        sqlfunc.count().label("count"),
+                        sqlfunc.avg(OHLCVDailyModel.pct_chg).label("avg_pct_chg"),
+                        sqlfunc.sum(case((OHLCVDailyModel.pct_chg > 0, 1), else_=0)).label("up_count"),
+                        sqlfunc.sum(case((OHLCVDailyModel.pct_chg < 0, 1), else_=0)).label("down_count"),
+                        sqlfunc.sum(OHLCVDailyModel.amount).label("total_amount"),
+                    )
+                    .join(OHLCVDailyModel, StockModel.ts_code == OHLCVDailyModel.ts_code)
+                    .where(OHLCVDailyModel.trade_date == latest_date)
+                    .where(StockModel.industry.isnot(None))
+                    .group_by(StockModel.industry)
+                    .order_by(order)
+                    .limit(limit)
+                )).all()
+                return _json.dumps([{
+                    "industry": r[0], "count": int(r[1]),
+                    "avg_pct_chg": round(float(r[2] or 0), 2),
+                    "up": int(r[3] or 0), "down": int(r[4] or 0),
+                    "amount_billion": round(float(r[5] or 0) / 1e8, 2),
+                } for r in rows], ensure_ascii=False)
+
+            elif name == "query_stock_history":
+                ts_code = args.get("ts_code", "")
+                days = args.get("days", 10)
+                rows = (await db.execute(
+                    select(OHLCVDailyModel).where(OHLCVDailyModel.ts_code == ts_code)
+                    .order_by(OHLCVDailyModel.trade_date.desc()).limit(days)
+                )).scalars().all()
+                if not rows:
+                    return _json.dumps({"error": f"股票{ts_code}无历史数据"}, ensure_ascii=False)
+                return _json.dumps([{
+                    "date": str(r.trade_date), "open": float(r.open), "high": float(r.high),
+                    "low": float(r.low), "close": float(r.close), "pct_chg": float(r.pct_chg),
+                    "volume": float(r.volume), "amount": float(r.amount or 0),
+                } for r in rows], ensure_ascii=False)
+
+            elif name == "search_stocks":
+                keyword = args.get("keyword", "")
+                rows = (await db.execute(
+                    select(StockModel).where(StockModel.name.ilike(f"%{keyword}%")).limit(10)
+                )).scalars().all()
+                return _json.dumps([{
+                    "name": s.name, "ts_code": s.ts_code, "industry": s.industry,
+                } for s in rows], ensure_ascii=False)
+
             else:
                 return _json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False)
         except Exception as e:
@@ -402,14 +483,27 @@ async def _run_agent(
 
     # --- Agent loop ---
     system_prompt = (
-        "你是 QuantOS AI 量化研究助手。你拥有工具可以查询A股市场实时数据。\n"
-        "根据用户的问题，自主决定调用哪些工具获取数据，然后基于真实数据给出专业分析。\n"
+        "你是 QuantOS AI 量化研究助手。你拥有以下工具可以查询A股市场实时数据，必须通过调用工具获取数据来回答用户问题：\n\n"
+        "可用工具：\n"
+        "- query_market_overview: 市场整体概况（涨跌家数、涨跌停数、成交额）\n"
+        "- query_indices: 主要指数行情（上证、深证、沪深300、创业板、科创50）\n"
+        "- query_limit_up: 涨停板个股列表\n"
+        "- query_sector(sector='行业名'): 指定行业的个股行情\n"
+        "- query_sector_ranking(sort_by='gainers'): 所有行业板块涨跌幅排行\n"
+        "- query_top_stocks(sort_by='gainers'): 涨幅/跌幅/成交额排行\n"
+        "- query_dragon_tiger: 龙虎榜数据\n"
+        "- query_stock(ts_code='代码'): 单只股票行情\n"
+        "- query_stock_history(ts_code='代码'): 股票历史行情\n"
+        "- search_stocks(keyword='关键词'): 按名称搜索股票\n\n"
         f"{market_brief}\n\n"
         "规则：\n"
-        "- 需要详细数据时调用工具，不要猜测或编造数据\n"
-        "- 回答要基于真实数据，用数据说话\n"
-        "- 回答简洁专业，同时通俗易懂\n"
-        "- 如果用户问的是某个板块/行业，调用query_sector获取该行业数据"
+        "- 你必须调用工具获取数据，不要凭空编造数据\n"
+        "- 用户问'哪个板块涨得最猛/板块排行'→ 调用 query_sector_ranking\n"
+        "- 用户问某个具体板块 → 调用 query_sector(sector='板块名')\n"
+        "- 用户问大盘/市场 → 调用 query_market_overview + query_indices\n"
+        "- 用户问涨停 → 调用 query_limit_up\n"
+        "- 用户问某只股票 → 调用 query_stock 或 search_stocks\n"
+        "- 回答要基于工具返回的真实数据，用数据说话，简洁专业"
     )
 
     llm_messages = [
