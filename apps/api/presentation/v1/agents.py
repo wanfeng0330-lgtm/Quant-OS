@@ -378,15 +378,38 @@ async def _run_agent(
         except Exception as e:
             return _json.dumps({"error": str(e)}, ensure_ascii=False)
 
+    # --- Pre-fetch market overview for system prompt (avoids extra tool calls) ---
+    market_brief = ""
+    try:
+        ohlcv_count = (await db.execute(select(sqlfunc.count()).select_from(OHLCVDailyModel))).scalar() or 0
+        if ohlcv_count > 0:
+            latest_date = (await db.execute(
+                select(OHLCVDailyModel.trade_date).group_by(OHLCVDailyModel.trade_date)
+                .order_by(sqlfunc.count().desc()).limit(1)
+            )).scalar_one_or_none()
+            if latest_date:
+                stats = (await db.execute(select(
+                    sqlfunc.count(),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg > 0, 1), else_=0)),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg < 0, 1), else_=0)),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg >= 9.9, 1), else_=0)),
+                    sqlfunc.sum(case((OHLCVDailyModel.pct_chg <= -9.9, 1), else_=0)),
+                    sqlfunc.sum(OHLCVDailyModel.amount),
+                ).where(OHLCVDailyModel.trade_date == latest_date))).one()
+                market_brief = f"\n当前数据库概况({latest_date}): {ohlcv_count}条行情, 涨{stats[1]}/跌{stats[2]}, 涨停{stats[3]}/跌停{stats[4]}, 成交额{round(float(stats[5] or 0)/1e8)}亿"
+    except Exception:
+        pass
+
     # --- Agent loop ---
     system_prompt = (
         "你是 QuantOS AI 量化研究助手。你拥有工具可以查询A股市场实时数据。\n"
         "根据用户的问题，自主决定调用哪些工具获取数据，然后基于真实数据给出专业分析。\n"
+        f"{market_brief}\n\n"
         "规则：\n"
-        "- 需要数据时主动调用工具，不要猜测或编造数据\n"
-        "- 可以多次调用不同工具来获取全面信息\n"
-        "- 回答要基于工具返回的真实数据，用数据说话\n"
-        "- 回答简洁专业，同时通俗易懂"
+        "- 需要详细数据时调用工具，不要猜测或编造数据\n"
+        "- 回答要基于真实数据，用数据说话\n"
+        "- 回答简洁专业，同时通俗易懂\n"
+        "- 如果用户问的是某个板块/行业，调用query_sector获取该行业数据"
     )
 
     llm_messages = [
@@ -394,7 +417,7 @@ async def _run_agent(
         Message(role=MessageRole.USER, content=message),
     ]
 
-    max_iterations = 5
+    max_iterations = 3
     total_tokens = 0
 
     for _ in range(max_iterations):

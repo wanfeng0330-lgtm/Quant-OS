@@ -2,7 +2,7 @@ import axios from 'axios'
 
 const apiClient = axios.create({
   baseURL: 'https://quant-os-production.up.railway.app/api',
-  timeout: 30000,
+  timeout: 120000,
   headers: {
     'Content-Type': 'application/json',
   },
