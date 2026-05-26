@@ -177,17 +177,28 @@ async def _do_full_sync(db: AsyncSession) -> dict:
                     pass
 
                 if tushare_provider:
-                    logger.info("Using Tushare for OHLCV sync (trade_date=%s)...", today)
-                    df = await tushare_provider.fetch_ohlcv_daily(trade_date=today)
+                    logger.info("Using Tushare for OHLCV sync...")
+                    # Try today first, then fall back to recent trading days
+                    from datetime import timedelta
+                    df = None
+                    actual_date = None
+                    for days_back in range(5):
+                        target_date = today - timedelta(days=days_back)
+                        logger.info("Trying Tushare for %s...", target_date)
+                        test_df = await tushare_provider.fetch_ohlcv_daily(trade_date=target_date)
+                        if not test_df.empty:
+                            df = test_df
+                            actual_date = target_date
+                            break
 
-                    if not df.empty:
+                    if df is not None and not df.empty:
                         records = df.to_dict("records")
                         inserted = await repo.bulk_insert(records)
                         await step_session.commit()
-                        logger.info("OHLCV via Tushare: %d records inserted for %s", inserted, today)
-                        results["ohlcv"] = {"inserted": inserted, "date": str(today), "source": "tushare"}
+                        logger.info("OHLCV via Tushare: %d records inserted for %s", inserted, actual_date)
+                        results["ohlcv"] = {"inserted": inserted, "date": str(actual_date), "source": "tushare"}
                     else:
-                        results["ohlcv"] = {"inserted": 0, "message": "Tushare returned no data for today"}
+                        results["ohlcv"] = {"inserted": 0, "message": "Tushare returned no data for recent days"}
                 else:
                     # Fallback: use AKShare market snapshot
                     logger.info("Tushare not available, falling back to AKShare snapshot...")
