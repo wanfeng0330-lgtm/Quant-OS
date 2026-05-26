@@ -39,6 +39,8 @@ class ToolParameter:
             "type": self.type.value,
             "description": self.description,
         }
+        if self.default is not None:
+            result["default"] = self.default
         if self.enum:
             result["enum"] = self.enum
         if self.items:

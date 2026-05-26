@@ -322,7 +322,7 @@ async def _run_agent(
 
             llm_messages.append(Message(
                 role=MessageRole.ASSISTANT,
-                content=response.content or "",
+                content=response.content,
                 tool_calls=tc_dicts,
             ))
 

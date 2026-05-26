@@ -66,11 +66,24 @@ class DeepSeekProvider(BaseLLMProvider):
             return llm_response
 
         except httpx.HTTPStatusError as e:
-            logger.error("DeepSeek API error: %s - %s", e.response.status_code, e.response.text)
-            # Log request details for 400 errors to help debugging
+            error_body = e.response.text
+            logger.error("DeepSeek API error: %s - %s", e.response.status_code, error_body)
             if e.response.status_code == 400:
-                logger.error("DeepSeek 400 request payload snippet: tools=%d, model=%s",
-                             len(tools) if tools else 0, payload.get("model"))
+                import json as _json
+                logger.error("DeepSeek 400 request: model=%s, tools=%d, tool_choice=%s",
+                             payload.get("model"), len(tools) if tools else 0,
+                             payload.get("tool_choice"))
+                # Log tool definitions for debugging
+                if "tools" in payload:
+                    for t in payload["tools"]:
+                        logger.error("  tool: %s -> %s", t["function"]["name"],
+                                     _json.dumps(t["function"]["parameters"], ensure_ascii=False))
+                # Log the actual error message from DeepSeek
+                try:
+                    err_json = _json.loads(error_body)
+                    logger.error("DeepSeek error detail: %s", _json.dumps(err_json, ensure_ascii=False))
+                except Exception:
+                    logger.error("DeepSeek raw error body: %s", error_body[:1000])
             if e.response.status_code == 429:
                 from quant_os_shared.errors import LLMRateLimitError
                 raise LLMRateLimitError("DeepSeek rate limit exceeded") from e
@@ -154,10 +167,7 @@ class DeepSeekProvider(BaseLLMProvider):
             "stream": stream,
         }
 
-        if config.frequency_penalty != 0:
-            payload["frequency_penalty"] = config.frequency_penalty
-        if config.presence_penalty != 0:
-            payload["presence_penalty"] = config.presence_penalty
+        # DeepSeek: frequency_penalty / presence_penalty are deprecated, skip them.
         if config.stop:
             payload["stop"] = config.stop
 
@@ -165,7 +175,8 @@ class DeepSeekProvider(BaseLLMProvider):
             payload["tools"] = [t.to_dict() for t in tools]
             payload["tool_choice"] = config.tool_choice or "auto"
 
-        return payload
+        # Remove None values to keep payload clean
+        return {k: v for k, v in payload.items() if v is not None}
 
     def _parse_response(self, data: dict[str, Any]) -> LLMResponse:
         """Parse the API response."""

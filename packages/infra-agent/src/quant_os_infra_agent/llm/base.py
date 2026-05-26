@@ -30,7 +30,10 @@ class Message:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to API-compatible dictionary."""
-        d = {"role": self.role.value, "content": self.content}
+        d: dict[str, Any] = {"role": self.role.value}
+        # content is required for most roles; for assistant with tool_calls it can be None/null
+        if self.content is not None:
+            d["content"] = self.content
         if self.name:
             d["name"] = self.name
         if self.tool_call_id:
