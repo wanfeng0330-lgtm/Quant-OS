@@ -107,6 +107,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
           messages: [...s.messages, assistantMsg],
           isRunning: false,
         }))
+      } else if (data.type === 'error') {
+        throw new Error(data.message || 'Agent 执行失败')
       } else if (data.run_id) {
         // Research workflow started
         const progressMsg: ChatMessage = {

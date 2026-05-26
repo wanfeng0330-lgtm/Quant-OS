@@ -411,11 +411,23 @@ async def _run_agent(
 
         # If LLM wants to call tools
         if response.has_tool_calls and response.tool_calls:
-            # Add assistant message with tool_calls
+            # Convert tool_calls to OpenAI format for the next message
+            tc_dicts = []
+            for tc in response.tool_calls:
+                tc_dict = {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.arguments, ensure_ascii=False) if isinstance(tc.arguments, dict) else str(tc.arguments),
+                    },
+                }
+                tc_dicts.append(tc_dict)
+
             llm_messages.append(Message(
                 role=MessageRole.ASSISTANT,
                 content=response.content or "",
-                tool_calls=[tc.__dict__ if hasattr(tc, '__dict__') else tc for tc in response.tool_calls],
+                tool_calls=tc_dicts,
             ))
 
             # Execute each tool call and add results
@@ -452,9 +464,23 @@ async def chat_message(
 
     try:
         result = await _run_agent(message, db)
+        if result.get("type") not in ("direct_answer", "error"):
+            result = {"type": "direct_answer", "content": str(result)}
         return ok(result)
     except Exception as e:
-        return ok({"type": "error", "message": f"Agent 执行失败: {str(e)}"})
+        import logging
+        logging.getLogger(__name__).error("Agent error: %s", e, exc_info=True)
+        # Fallback: direct LLM answer without tools
+        try:
+            settings = get_app_settings()
+            provider = LLMProviderFactory.create(settings.llm.default_provider)
+            response = await provider.chat(
+                [Message(role=MessageRole.SYSTEM, content="你是QuantOS AI量化研究助手。"), Message(role=MessageRole.USER, content=message)],
+                config=LLMConfig(model=settings.llm.mimo_model, temperature=0.5, max_tokens=2000),
+            )
+            return ok({"type": "direct_answer", "content": response.content or "无法处理请求", "model": response.model})
+        except Exception:
+            return ok({"type": "error", "message": f"Agent 执行失败: {str(e)}"})
 
 
 @router.get("")
