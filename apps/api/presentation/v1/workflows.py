@@ -446,12 +446,15 @@ async def _execute_llm_node(
     log_fn(f"LLM调用: {provider_name}/{settings.llm.mimo_model}", node_id=node["id"])
 
     try:
+        # Use fewer tokens for analysis nodes, more for report synthesis
+        is_report = "report" in node["id"]
+        max_tokens = 5000 if is_report else 3000
         response = await provider.chat(
             messages,
             config=LLMConfig(
                 model=settings.llm.mimo_model,
                 temperature=0.3,
-                max_tokens=5000,
+                max_tokens=max_tokens,
             ),
         )
         tokens = response.usage.total_tokens if response.usage else 0
@@ -511,7 +514,7 @@ async def _execute_tool_node(
                 result_data["stocks_count"] = total
                 log_fn(f"数据库: {total} 只股票", node_id=node["id"])
 
-                # --- Market Indices ---
+                # --- Market Indices (parallel fetch) ---
                 try:
                     import akshare as ak
                     loop = asyncio.get_event_loop()
@@ -522,15 +525,16 @@ async def _execute_tool_node(
                         "创业板指": "sz399006",
                         "科创50": "sh000688",
                     }
-                    index_data = {}
-                    for name, symbol in indices.items():
+                    start_date = (datetime.now().date() - timedelta(days=10)).strftime("%Y%m%d")
+
+                    async def _fetch_index(name: str, symbol: str):
                         try:
-                            df = await loop.run_in_executor(None, lambda s=symbol: ak.stock_zh_index_daily_em(symbol=s, start_date=(datetime.now().date() - timedelta(days=10)).strftime("%Y%m%d")))
+                            df = await loop.run_in_executor(None, lambda s=symbol: ak.stock_zh_index_daily_em(symbol=s, start_date=start_date))
                             if not df.empty:
                                 latest = df.iloc[-1]
                                 prev = df.iloc[-2] if len(df) > 1 else latest
                                 pct = round((float(latest["close"]) - float(prev["close"])) / float(prev["close"]) * 100, 2) if float(prev["close"]) > 0 else 0
-                                index_data[name] = {
+                                return name, {
                                     "close": round(float(latest["close"]), 2),
                                     "pct_chg": pct,
                                     "volume_billion": round(float(latest["volume"]) / 1e8, 2),
@@ -539,6 +543,10 @@ async def _execute_tool_node(
                                 }
                         except Exception:
                             pass
+                        return name, None
+
+                    index_results = await asyncio.gather(*[_fetch_index(n, s) for n, s in indices.items()])
+                    index_data = {name: data for name, data in index_results if data}
                     if index_data:
                         result_data["market_indices"] = index_data
                         log_fn(f"指数数据: {len(index_data)} 个指数", node_id=node["id"])

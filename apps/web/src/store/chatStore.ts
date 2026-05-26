@@ -329,11 +329,16 @@ function _handleCompletion(
     }
   }
 
-  // If no report message was received, extract from node_results
+  // Always extract report from node_results (handles both first and subsequent runs)
   if (finalStatus === 'completed') {
     const currentState = get()
-    const hasReport = currentState.messages.some((m) => m.role === 'report')
-    if (!hasReport) {
+    // Check if THIS run already produced a report message (by checking progress msg timing)
+    const progressIdx = currentState.messages.findIndex((m) => m.id === progressMsgId)
+    const hasReportForThisRun = currentState.messages
+      .slice(progressIdx)
+      .some((m) => m.role === 'report')
+
+    if (!hasReportForThisRun) {
       let reportContent = ''
       for (const [nid, result] of Object.entries(run.node_results || {})) {
         if (nid.includes('report')) {

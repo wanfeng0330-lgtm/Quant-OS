@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from 'react'
 import { useChatStore } from '../store/chatStore'
 import WorkflowProgress from '../components/WorkflowProgress'
 import ReportCard from '../components/ReportCard'
-import DataSyncStatus from '../components/DataSyncStatus'
 
 const SUGGESTIONS = [
   '分析今日A股市场情绪',
@@ -52,11 +51,6 @@ export default function Chat() {
 
   return (
     <div className="h-full flex flex-col">
-      {/* Sync status bar */}
-      <div className="shrink-0 border-b border-gray-800/80 px-4 py-2">
-        <DataSyncStatus />
-      </div>
-
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto">
         {isEmpty ? (
@@ -68,13 +62,9 @@ export default function Chat() {
             <h1 className="mb-2 text-2xl font-bold text-gray-100">
               QuantOS AI 量化研究助手
             </h1>
-            <p className="mb-6 text-sm text-gray-500 max-w-md text-center leading-relaxed">
+            <p className="mb-8 text-sm text-gray-500 max-w-md text-center leading-relaxed">
               输入你的研究需求，AI 将自动执行数据获取、因子探索、市场分析、情绪研判，最终生成完整的研究报告。
             </p>
-
-            <div className="mb-6 max-w-lg w-full">
-              <DataSyncStatus />
-            </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-w-lg w-full">
               {SUGGESTIONS.map((s) => (
